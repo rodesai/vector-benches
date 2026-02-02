@@ -1,9 +1,9 @@
 use clap::Parser;
 use std::time::Instant;
 use usearch_bench::{
-    build_index, generate_random_vectors, load_from_buffer, serialize_to_buffer, BenchConfig,
-    DEFAULT_CONNECTIVITY, DEFAULT_DIMENSIONS, DEFAULT_EXPANSION_ADD, DEFAULT_EXPANSION_SEARCH,
-    DEFAULT_NUM_VECTORS,
+    build_index_parallel, generate_partitioned_vectors, load_from_buffer, serialize_to_buffer,
+    BenchConfig, DEFAULT_CONNECTIVITY, DEFAULT_DIMENSIONS, DEFAULT_EXPANSION_ADD,
+    DEFAULT_EXPANSION_SEARCH, DEFAULT_NUM_THREADS, DEFAULT_NUM_VECTORS,
 };
 
 #[derive(Parser, Debug)]
@@ -33,6 +33,10 @@ struct Args {
     /// Random seed for reproducibility
     #[arg(short = 's', long, default_value_t = 42)]
     seed: u64,
+
+    /// Number of threads for parallel index building (0 = use all available cores)
+    #[arg(short = 't', long, default_value_t = DEFAULT_NUM_THREADS)]
+    threads: usize,
 }
 
 fn format_duration(duration: std::time::Duration) -> String {
@@ -78,8 +82,11 @@ fn main() {
         connectivity: args.connectivity,
         expansion_add: args.expansion_add,
         expansion_search: args.expansion_search,
+        num_threads: args.threads,
         ..Default::default()
     };
+
+    let effective_threads = config.effective_threads();
 
     println!("=== USearch Benchmark ===");
     println!();
@@ -89,22 +96,31 @@ fn main() {
     println!("  Connectivity:   {:>12}", args.connectivity);
     println!("  Expansion (add):{:>12}", args.expansion_add);
     println!("  Expansion (search):{:>9}", args.expansion_search);
+    println!("  Threads:        {:>12}", effective_threads);
     println!("  Seed:           {:>12}", args.seed);
     println!();
 
-    // Generate random vectors
-    print!("Generating {} random vectors... ", args.num_vectors);
+    // Generate random vectors (partitioned for multi-threaded building)
+    print!(
+        "Generating {} random vectors ({} partitions)... ",
+        args.num_vectors, effective_threads
+    );
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
     let start = Instant::now();
-    let vectors = generate_random_vectors(config.num_vectors, config.dimensions, args.seed);
+    let partitioned_vectors = generate_partitioned_vectors(
+        config.num_vectors,
+        config.dimensions,
+        effective_threads,
+        args.seed,
+    );
     let gen_duration = start.elapsed();
     println!("done ({})", format_duration(gen_duration));
     println!();
 
-    // Benchmark: Build index
-    println!("--- Build Index ---");
+    // Benchmark: Build index (parallel)
+    println!("--- Build Index ({} threads) ---", effective_threads);
     let start = Instant::now();
-    let index = build_index(&config, &vectors);
+    let index = build_index_parallel(&config, &partitioned_vectors);
     let build_duration = start.elapsed();
     println!(
         "  Time:           {:>12}",

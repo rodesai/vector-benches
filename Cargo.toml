@@ -7,6 +7,7 @@ edition = "2021"
 usearch = "2"
 rand = "0.8"
 rand_xoshiro = "0.6"
+rayon = "1.10"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]

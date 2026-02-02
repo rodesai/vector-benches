@@ -1,6 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use usearch_bench::{
-    build_index, generate_random_vectors, load_from_buffer, serialize_to_buffer, BenchConfig,
+    build_index_parallel, generate_partitioned_vectors, load_from_buffer, serialize_to_buffer,
+    BenchConfig,
 };
 
 /// Get the number of vectors from environment variable, or use default
@@ -11,22 +12,38 @@ fn get_num_vectors() -> usize {
         .unwrap_or(usearch_bench::DEFAULT_NUM_VECTORS)
 }
 
+/// Get the number of threads from environment variable, or use default (0 = all cores)
+fn get_num_threads() -> usize {
+    std::env::var("USEARCH_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usearch_bench::DEFAULT_NUM_THREADS)
+}
+
 fn bench_build_index(c: &mut Criterion) {
     let num_vectors = get_num_vectors();
-    let config = BenchConfig::default().with_num_vectors(num_vectors);
+    let num_threads = get_num_threads();
+    let config = BenchConfig::default()
+        .with_num_vectors(num_vectors)
+        .with_num_threads(num_threads);
+    let effective_threads = config.effective_threads();
 
-    // Pre-generate vectors outside the benchmark
-    let vectors = generate_random_vectors(config.num_vectors, config.dimensions, 42);
+    // Pre-generate partitioned vectors outside the benchmark
+    let partitioned =
+        generate_partitioned_vectors(config.num_vectors, config.dimensions, effective_threads, 42);
 
     let mut group = c.benchmark_group("index_build");
     group.throughput(Throughput::Elements(num_vectors as u64));
     group.sample_size(10); // Reduce sample size for large indexes
 
     group.bench_with_input(
-        BenchmarkId::new("build", format!("{} vectors", num_vectors)),
-        &vectors,
-        |b, vectors| {
-            b.iter(|| build_index(&config, vectors));
+        BenchmarkId::new(
+            "build_parallel",
+            format!("{} vectors, {} threads", num_vectors, effective_threads),
+        ),
+        &partitioned,
+        |b, partitioned| {
+            b.iter(|| build_index_parallel(&config, partitioned));
         },
     );
 
@@ -35,11 +52,16 @@ fn bench_build_index(c: &mut Criterion) {
 
 fn bench_serialize_index(c: &mut Criterion) {
     let num_vectors = get_num_vectors();
-    let config = BenchConfig::default().with_num_vectors(num_vectors);
+    let num_threads = get_num_threads();
+    let config = BenchConfig::default()
+        .with_num_vectors(num_vectors)
+        .with_num_threads(num_threads);
+    let effective_threads = config.effective_threads();
 
     // Pre-build index outside the benchmark
-    let vectors = generate_random_vectors(config.num_vectors, config.dimensions, 42);
-    let index = build_index(&config, &vectors);
+    let partitioned =
+        generate_partitioned_vectors(config.num_vectors, config.dimensions, effective_threads, 42);
+    let index = build_index_parallel(&config, &partitioned);
 
     let serialized_size = index.serialized_length();
 
@@ -60,11 +82,16 @@ fn bench_serialize_index(c: &mut Criterion) {
 
 fn bench_load_index(c: &mut Criterion) {
     let num_vectors = get_num_vectors();
-    let config = BenchConfig::default().with_num_vectors(num_vectors);
+    let num_threads = get_num_threads();
+    let config = BenchConfig::default()
+        .with_num_vectors(num_vectors)
+        .with_num_threads(num_threads);
+    let effective_threads = config.effective_threads();
 
     // Pre-build and serialize index outside the benchmark
-    let vectors = generate_random_vectors(config.num_vectors, config.dimensions, 42);
-    let index = build_index(&config, &vectors);
+    let partitioned =
+        generate_partitioned_vectors(config.num_vectors, config.dimensions, effective_threads, 42);
+    let index = build_index_parallel(&config, &partitioned);
     let buffer = serialize_to_buffer(&index);
 
     let mut group = c.benchmark_group("index_load");
