@@ -82,7 +82,7 @@ impl SPFreshIndex {
         };
 
         let centroid_index = new_index(&index_options).expect("Failed to create centroid index");
-        centroid_index.reserve(1000).expect("Failed to reserve");
+        centroid_index.reserve(100000).expect("Failed to reserve");
 
         // Initialize with a single zero centroid
         let zero_centroid: Vec<f32> = vec![0.0; config.dimensions];
@@ -142,7 +142,8 @@ impl SPFreshIndex {
 
     fn add_to_centroids_index(&mut self, id: u64, v: &[f32]) {
         if let Err(e) = self.centroid_index.add(id, &v) {
-            self.centroid_index.reserve(1024).expect("Failed to reserve");
+            println!("RESERVING: {}", self.centroid_vectors.len() + 1024);
+            self.centroid_index.reserve(self.centroid_vectors.len() + 1024).expect("Failed to reserve");
             self.centroid_index.add(id, &v).expect("Failed to add to index");
         }
         self.centroid_vectors.insert(id, v.into());
@@ -200,8 +201,8 @@ impl SPFreshIndex {
         self.reassign_from_neighbors(new_id2);
 
         // Check if new centroids need merging (unlikely after split, but for consistency)
-        //self.check_merge(new_id1);
-        //self.check_merge(new_id2);
+        self.check_merge(new_id1);
+        self.check_merge(new_id2);
     }
 
     /// Run k-means with k=2 on the given vectors
@@ -830,7 +831,7 @@ struct Args {
     kmeans_iters: usize,
 
     /// Number of queries for recall evaluation
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 100)]
     num_queries: usize,
 
     /// K for k-NN search
