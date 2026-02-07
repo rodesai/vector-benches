@@ -15,7 +15,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "spfresh"
-path = "src/bin/spfresh.rs"
+path = "src/bin/spfresh/main.rs"
 
 [[bench]]
 name = "index_benchmark"

@@ -1,4 +1,7 @@
+mod datasets;
+
 use clap::Parser;
+use datasets::{Dataset, DatasetType};
 use rand::Rng;
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -840,6 +843,18 @@ struct Args {
     /// Input directory to load a previously saved index (skips building)
     #[arg(short = 'i', long)]
     input_dir: Option<String>,
+
+    /// Dataset type: random, sift1m, sift100m, or deep1m
+    #[arg(long, default_value = "random")]
+    dataset: DatasetType,
+
+    /// Directory containing dataset files (required for sift1m/sift100m/deep1m)
+    #[arg(long)]
+    dataset_dir: Option<String>,
+
+    /// Show download instructions for a dataset
+    #[arg(long)]
+    download_help: Option<DatasetType>,
 }
 
 fn generate_random_vectors(num_vectors: usize, dimensions: usize, seed: u64) -> Vec<Vec<f32>> {
@@ -853,6 +868,13 @@ fn compute_recall(approximate: &[(u64, f32)], exact: &[(u64, f32)]) -> f64 {
     let exact_ids: HashSet<u64> = exact.iter().map(|(id, _)| *id).collect();
     let hits = approximate.iter().filter(|(id, _)| exact_ids.contains(id)).count();
     hits as f64 / exact.len() as f64
+}
+
+/// Compute recall using ground truth indices (for benchmark datasets)
+fn compute_recall_gt(approximate: &[(u64, f32)], ground_truth: &[u32], k: usize) -> f64 {
+    let gt_set: HashSet<u64> = ground_truth.iter().take(k).map(|&id| id as u64).collect();
+    let hits = approximate.iter().filter(|(id, _)| gt_set.contains(id)).count();
+    hits as f64 / k as f64
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -870,8 +892,37 @@ fn format_bytes(bytes: usize) -> String {
 fn main() {
     let args = Args::parse();
 
+    // Handle download help
+    if let Some(dataset_type) = args.download_help {
+        datasets::print_download_instructions(dataset_type);
+        return;
+    }
+
+    // Load dataset if using sift1m or deep1m
+    let dataset: Option<Dataset> = if args.dataset != DatasetType::Random {
+        let dataset_dir = args.dataset_dir.as_ref().unwrap_or_else(|| {
+            eprintln!("Error: --dataset-dir is required when using {} dataset", args.dataset);
+            eprintln!("Use --download-help {} to see download instructions", args.dataset);
+            std::process::exit(1);
+        });
+
+        match datasets::load_dataset(args.dataset, Path::new(dataset_dir), Some(args.num_vectors)) {
+            Ok(ds) => Some(ds),
+            Err(e) => {
+                eprintln!("Error loading dataset: {}", e);
+                eprintln!("Use --download-help {} to see download instructions", args.dataset);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Get dimensions from dataset or args
+    let dimensions = dataset.as_ref().map(|ds| ds.dimensions).unwrap_or(args.dimensions);
+
     let config = SPFreshConfig {
-        dimensions: args.dimensions,
+        dimensions,
         max_posting_size: args.max_posting_size,
         min_posting_size: args.min_posting_size,
         num_probes: args.num_probes,
@@ -915,9 +966,12 @@ fn main() {
         }
     } else {
         // Build new index
+        let num_vectors = dataset.as_ref().map(|ds| ds.num_base()).unwrap_or(args.num_vectors);
+
         println!("Configuration:");
-        println!("  Vectors:            {:>10}", args.num_vectors);
-        println!("  Dimensions:         {:>10}", args.dimensions);
+        println!("  Dataset:            {:>10}", args.dataset);
+        println!("  Vectors:            {:>10}", num_vectors);
+        println!("  Dimensions:         {:>10}", dimensions);
         println!("  Max posting size:   {:>10}", args.max_posting_size);
         println!("  Min posting size:   {:>10}", args.min_posting_size);
         println!("  Num probes:         {:>10}", args.num_probes);
@@ -928,12 +982,18 @@ fn main() {
         println!("  Seed:               {:>10}", args.seed);
         println!();
 
-        // Generate data
-        print!("Generating {} vectors... ", args.num_vectors);
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        let start = Instant::now();
-        let vectors = generate_random_vectors(args.num_vectors, args.dimensions, args.seed);
-        println!("done ({:.2}s)", start.elapsed().as_secs_f64());
+        // Get vectors from dataset or generate random
+        let vectors: Vec<Vec<f32>> = if let Some(ref ds) = dataset {
+            println!("Using {} dataset vectors", ds.name);
+            ds.base_vectors.clone()
+        } else {
+            print!("Generating {} vectors... ", num_vectors);
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let start = Instant::now();
+            let vecs = generate_random_vectors(num_vectors, dimensions, args.seed);
+            println!("done ({:.2}s)", start.elapsed().as_secs_f64());
+            vecs
+        };
 
         // Build index
         println!();
@@ -941,7 +1001,7 @@ fn main() {
         let mut idx = SPFreshIndex::new(config);
         let start = Instant::now();
 
-        let report_interval = (args.num_vectors / 20).max(1000).min(args.num_vectors);
+        let report_interval = (num_vectors / 20).max(1000).min(num_vectors);
         let mut last_report = Instant::now();
 
         for (i, vector) in vectors.iter().enumerate() {
@@ -950,7 +1010,7 @@ fn main() {
             // Report every interval or every 10 seconds, whichever comes first
             let should_report = (i + 1) % report_interval == 0
                 || last_report.elapsed().as_secs_f64() >= 1.0
-                || i + 1 == args.num_vectors;
+                || i + 1 == num_vectors;
 
             if should_report && i > 0 {
                 let elapsed = start.elapsed().as_secs_f64();
@@ -960,7 +1020,7 @@ fn main() {
                 // Use carriage return to overwrite the line
                 println!(
                     "{:>6.1}% | {:>8} vecs | {:>5} centroids | {:>5} splits | {:>5} merges | {:>7} reassigned | {:>8.0} vec/s | {:.1}s",
-                    (i + 1) as f64 / args.num_vectors as f64 * 100.0,
+                    (i + 1) as f64 / num_vectors as f64 * 100.0,
                     i + 1,
                     stats.num_centroids,
                     stats.num_splits,
@@ -977,7 +1037,7 @@ fn main() {
 
         println!();
         let stats = idx.stats();
-        println!("Build complete in {:.2}s ({:.0} vectors/sec)", build_time.as_secs_f64(), args.num_vectors as f64 / build_time.as_secs_f64());
+        println!("Build complete in {:.2}s ({:.0} vectors/sec)", build_time.as_secs_f64(), num_vectors as f64 / build_time.as_secs_f64());
         println!("  Num centroids:      {:>10}", stats.num_centroids);
         println!("  Total vectors:      {:>10}", stats.total_vectors);
         println!("  Min posting size:   {:>10}", stats.min_posting_size);
@@ -1020,33 +1080,52 @@ fn main() {
         }
     }
 
-    // Generate query vectors (using index dimensions for compatibility with loaded indices)
-    print!("Generating {} query vectors... ", args.num_queries);
-    std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    let queries = generate_random_vectors(args.num_queries, index.dimensions(), args.seed + 1000);
-    println!("done");
+    // Get or generate query vectors
+    let (queries, ground_truth): (Vec<Vec<f32>>, Option<Vec<Vec<u32>>>) = if let Some(ref ds) = dataset {
+        let num_queries = args.num_queries.min(ds.num_queries());
+        println!("Using {} query vectors from {} dataset", num_queries, ds.name);
+        (
+            ds.query_vectors.iter().take(num_queries).cloned().collect(),
+            Some(ds.ground_truth.iter().take(num_queries).cloned().collect()),
+        )
+    } else {
+        print!("Generating {} query vectors... ", args.num_queries);
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let q = generate_random_vectors(args.num_queries, index.dimensions(), args.seed + 1000);
+        println!("done");
+        (q, None)
+    };
 
     // Evaluate recall
     println!();
     println!("--- Evaluating Recall ---");
+    let has_ground_truth = ground_truth.is_some();
+    if has_ground_truth {
+        println!("Using ground truth from dataset for recall computation");
+    } else {
+        println!("Using brute-force search for recall computation");
+    }
     let start = Instant::now();
 
     let mut total_recall = 0.0;
-    let mut search_times = Vec::with_capacity(args.num_queries);
+    let mut search_times = Vec::with_capacity(queries.len());
 
-    for query in &queries {
+    for (i, query) in queries.iter().enumerate() {
         let search_start = Instant::now();
         let approximate = index.search(query, args.k);
         search_times.push(search_start.elapsed().as_secs_f64() * 1000.0); // ms
 
-        let exact = index.brute_force_search(query, args.k);
-        let recall = compute_recall(&approximate, &exact);
-        println!("{:?}: query recall: {}", Instant::now(), recall);
+        let recall = if let Some(ref gt) = ground_truth {
+            compute_recall_gt(&approximate, &gt[i], args.k)
+        } else {
+            let exact = index.brute_force_search(query, args.k);
+            compute_recall(&approximate, &exact)
+        };
         total_recall += recall;
     }
 
     let eval_time = start.elapsed();
-    let avg_recall = total_recall / args.num_queries as f64;
+    let avg_recall = total_recall / queries.len() as f64;
 
     search_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p50_latency = search_times[search_times.len() / 2];
@@ -1056,6 +1135,7 @@ fn main() {
     println!("Evaluation complete in {:.2}s", eval_time.as_secs_f64());
     println!();
     println!("=== Results ===");
+    println!("  Dataset:            {:>10}", args.dataset);
     println!("  Recall@{}:          {:>10.4}", args.k, avg_recall);
     println!("  Avg latency:        {:>10.3} ms", avg_latency);
     println!("  P50 latency:        {:>10.3} ms", p50_latency);
