@@ -4,7 +4,7 @@ use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read as IoRead, Write};
 use std::path::Path;
 use std::time::Instant;
 use usearch::{new_index, Index, IndexOptions, MetricKind, ScalarKind};
@@ -140,6 +140,14 @@ impl SPFreshIndex {
         }
     }
 
+    fn add_to_centroids_index(&mut self, id: u64, v: &[f32]) {
+        if let Err(e) = self.centroid_index.add(id, &v) {
+            self.centroid_index.reserve(1024).expect("Failed to reserve");
+            self.centroid_index.add(id, &v).expect("Failed to add to index");
+        }
+        self.centroid_vectors.insert(id, v.into());
+    }
+
     /// Split a centroid into two using k-means
     fn split(&mut self, centroid_id: u64) {
         let vectors = match self.posting_lists.remove(&centroid_id) {
@@ -167,14 +175,8 @@ impl SPFreshIndex {
         self.centroid_vectors.remove(&centroid_id);
 
         // Add new centroids to index
-        self.centroid_index
-            .add(new_id1, &centroid1)
-            .expect("Failed to add centroid");
-        self.centroid_index
-            .add(new_id2, &centroid2)
-            .expect("Failed to add centroid");
-        self.centroid_vectors.insert(new_id1, centroid1.clone());
-        self.centroid_vectors.insert(new_id2, centroid2.clone());
+        self.add_to_centroids_index(new_id1, &centroid1);
+        self.add_to_centroids_index(new_id2, &centroid2);
 
         // Assign vectors to new centroids
         let mut list1 = Vec::new();
@@ -198,8 +200,8 @@ impl SPFreshIndex {
         self.reassign_from_neighbors(new_id2);
 
         // Check if new centroids need merging (unlikely after split, but for consistency)
-        self.check_merge(new_id1);
-        self.check_merge(new_id2);
+        //self.check_merge(new_id1);
+        //self.check_merge(new_id2);
     }
 
     /// Run k-means with k=2 on the given vectors
@@ -330,23 +332,38 @@ impl SPFreshIndex {
         self.merge(centroid_id);
     }
 
-    /// Merge a centroid with its nearest neighbor
+    /// Merge a centroid with its nearest neighbor that won't cause an immediate split
     fn merge(&mut self, centroid_id: u64) {
         let centroid_vec = match self.centroid_vectors.get(&centroid_id) {
             Some(v) => v.clone(),
             None => return,
         };
 
-        // Find nearest neighbor
-        let neighbors = self.centroid_index.search(&centroid_vec, 2).expect("Search failed");
+        let my_size = self.posting_lists.get(&centroid_id).map(|l| l.len()).unwrap_or(0);
 
-        let neighbor_id = neighbors.keys.iter()
-            .find(|&&id| id != centroid_id)
-            .copied();
+        // Find nearest neighbors and pick one where merging won't trigger immediate split
+        let num_candidates = (self.centroid_vectors.len()).min(20); // Check up to 20 nearest
+        let neighbors = self.centroid_index
+            .search(&centroid_vec, num_candidates)
+            .expect("Search failed");
 
+        let mut neighbor_id = None;
+        for &candidate_id in &neighbors.keys {
+            if candidate_id == centroid_id {
+                continue;
+            }
+            let candidate_size = self.posting_lists.get(&candidate_id).map(|l| l.len()).unwrap_or(0);
+            // Only merge if combined size won't exceed max_posting_size
+            if my_size + candidate_size <= self.config.max_posting_size {
+                neighbor_id = Some(candidate_id);
+                break;
+            }
+        }
+
+        // If no suitable neighbor found, don't merge (avoid split-merge cycle)
         let neighbor_id = match neighbor_id {
             Some(id) => id,
-            None => return, // No other centroid to merge with
+            None => return,
         };
 
         self.num_merges += 1;
@@ -375,17 +392,10 @@ impl SPFreshIndex {
         let new_id = self.next_centroid_id;
         self.next_centroid_id += 1;
 
-        self.centroid_index
-            .add(new_id, &new_centroid)
-            .expect("Failed to add merged centroid");
-        self.centroid_vectors.insert(new_id, new_centroid);
+        self.add_to_centroids_index(new_id, &new_centroid);
         self.posting_lists.insert(new_id, merged_vectors);
 
-        // Check if merged centroid now needs splitting
-        let merged_size = self.posting_lists.get(&new_id).map(|l| l.len()).unwrap_or(0);
-        if merged_size > self.config.max_posting_size {
-            self.split(new_id);
-        }
+        // No need to check for split - we ensured merged size <= max_posting_size
     }
 
     /// Compute centroid (mean) of vectors
@@ -455,6 +465,16 @@ impl SPFreshIndex {
             .zip(b.iter())
             .map(|(x, y)| (x - y) * (x - y))
             .sum()
+    }
+
+    /// Get the number of dimensions
+    pub fn dimensions(&self) -> usize {
+        self.config.dimensions
+    }
+
+    /// Set the number of probes (for tuning recall after loading)
+    pub fn set_num_probes(&mut self, num_probes: usize) {
+        self.config.num_probes = num_probes;
     }
 
     /// Get index statistics
@@ -599,6 +619,168 @@ impl SPFreshIndex {
         writer.flush()?;
         Ok(())
     }
+
+    /// Load an index from a directory
+    pub fn load<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
+        let dir = dir.as_ref();
+
+        // Load metadata first to get config
+        let metadata_path = dir.join("metadata.json");
+        let metadata_content = fs::read_to_string(&metadata_path)?;
+        let config = Self::parse_metadata(&metadata_content)?;
+
+        // Create index options
+        let index_options = IndexOptions {
+            dimensions: config.dimensions,
+            metric: MetricKind::L2sq,
+            quantization: ScalarKind::F32,
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
+            multi: false,
+        };
+
+        // Load centroid index using usearch's native format
+        let centroid_path = dir.join("centroids.usearch");
+        let centroid_index = new_index(&index_options)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.what()))?;
+        centroid_index
+            .load(centroid_path.to_str().unwrap())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.what()))?;
+
+        // Load centroid vectors
+        let centroid_vectors_path = dir.join("centroid_vectors.bin");
+        let centroid_vectors = Self::load_centroid_vectors(&centroid_vectors_path)?;
+
+        // Load posting lists (all vectors with their assignments)
+        let vectors_path = dir.join("vectors.bin");
+        let (posting_lists, total_vectors, next_centroid_id) =
+            Self::load_vectors(&vectors_path, config.dimensions)?;
+
+        Ok(Self {
+            config,
+            centroid_index,
+            posting_lists,
+            centroid_vectors,
+            next_centroid_id,
+            total_vectors,
+            num_splits: 0,
+            num_merges: 0,
+            num_reassigned: 0,
+        })
+    }
+
+    /// Parse metadata JSON to extract config
+    fn parse_metadata(content: &str) -> std::io::Result<SPFreshConfig> {
+        // Simple JSON parsing without serde
+        let get_value = |key: &str| -> std::io::Result<usize> {
+            let pattern = format!("\"{}\": ", key);
+            let start = content.find(&pattern).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Missing key: {}", key))
+            })?;
+            let rest = &content[start + pattern.len()..];
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            rest[..end].parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid value for {}", key))
+            })
+        };
+
+        Ok(SPFreshConfig {
+            dimensions: get_value("dimensions")?,
+            max_posting_size: get_value("max_posting_size")?,
+            min_posting_size: get_value("min_posting_size")?,
+            num_probes: get_value("num_probes")?,
+            reassign_neighbors: get_value("reassign_neighbors")?,
+            kmeans_iters: get_value("kmeans_iters")?,
+        })
+    }
+
+    /// Load centroid vectors from binary file
+    fn load_centroid_vectors<P: AsRef<Path>>(path: P) -> std::io::Result<HashMap<u64, Vec<f32>>> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read header
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8)?;
+        let num_centroids = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let dimensions = u64::from_le_bytes(buf8) as usize;
+
+        let mut centroid_vectors = HashMap::with_capacity(num_centroids);
+        let mut buf4 = [0u8; 4];
+
+        for _ in 0..num_centroids {
+            // Read centroid ID
+            reader.read_exact(&mut buf8)?;
+            let id = u64::from_le_bytes(buf8);
+
+            // Read vector
+            let mut vector = Vec::with_capacity(dimensions);
+            for _ in 0..dimensions {
+                reader.read_exact(&mut buf4)?;
+                vector.push(f32::from_le_bytes(buf4));
+            }
+            centroid_vectors.insert(id, vector);
+        }
+
+        Ok(centroid_vectors)
+    }
+
+    /// Load vectors from binary file, returning posting lists and metadata
+    fn load_vectors<P: AsRef<Path>>(
+        path: P,
+        dimensions: usize,
+    ) -> std::io::Result<(HashMap<u64, Vec<StoredVector>>, usize, u64)> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read header
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8)?;
+        let total_vectors = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let file_dimensions = u64::from_le_bytes(buf8) as usize;
+
+        if file_dimensions != dimensions {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Dimension mismatch: expected {}, got {}", dimensions, file_dimensions),
+            ));
+        }
+
+        let mut posting_lists: HashMap<u64, Vec<StoredVector>> = HashMap::new();
+        let mut max_centroid_id: u64 = 0;
+        let mut buf4 = [0u8; 4];
+
+        for _ in 0..total_vectors {
+            // Read centroid ID
+            reader.read_exact(&mut buf8)?;
+            let centroid_id = u64::from_le_bytes(buf8);
+            max_centroid_id = max_centroid_id.max(centroid_id);
+
+            // Read vector ID
+            reader.read_exact(&mut buf8)?;
+            let vector_id = u64::from_le_bytes(buf8);
+
+            // Read vector data
+            let mut data = Vec::with_capacity(dimensions);
+            for _ in 0..dimensions {
+                reader.read_exact(&mut buf4)?;
+                data.push(f32::from_le_bytes(buf4));
+            }
+
+            posting_lists
+                .entry(centroid_id)
+                .or_default()
+                .push(StoredVector { id: vector_id, data });
+        }
+
+        // Next centroid ID should be max + 1
+        let next_centroid_id = max_centroid_id + 1;
+
+        Ok((posting_lists, total_vectors, next_centroid_id))
+    }
 }
 
 /// Index statistics
@@ -662,6 +844,10 @@ struct Args {
     /// Output directory to save index and vectors (if specified)
     #[arg(short = 'o', long)]
     output_dir: Option<String>,
+
+    /// Input directory to load a previously saved index (skips building)
+    #[arg(short = 'i', long)]
+    input_dir: Option<String>,
 }
 
 fn generate_random_vectors(num_vectors: usize, dimensions: usize, seed: u64) -> Vec<Vec<f32>> {
@@ -703,84 +889,113 @@ fn main() {
 
     println!("=== SPFresh Index Benchmark ===");
     println!();
-    println!("Configuration:");
-    println!("  Vectors:            {:>10}", args.num_vectors);
-    println!("  Dimensions:         {:>10}", args.dimensions);
-    println!("  Max posting size:   {:>10}", args.max_posting_size);
-    println!("  Min posting size:   {:>10}", args.min_posting_size);
-    println!("  Num probes:         {:>10}", args.num_probes);
-    println!("  Reassign neighbors: {:>10}", args.reassign_neighbors);
-    println!("  K-means iters:      {:>10}", args.kmeans_iters);
-    println!("  Num queries:        {:>10}", args.num_queries);
-    println!("  K (for k-NN):       {:>10}", args.k);
-    println!("  Seed:               {:>10}", args.seed);
-    println!();
 
-    // Generate data
-    print!("Generating {} vectors... ", args.num_vectors);
-    std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    let start = Instant::now();
-    let vectors = generate_random_vectors(args.num_vectors, args.dimensions, args.seed);
-    println!("done ({:.2}s)", start.elapsed().as_secs_f64());
+    // Either load existing index or build new one
+    let index = if let Some(ref input_dir) = args.input_dir {
+        // Load from directory
+        println!("--- Loading Index ---");
+        print!("Loading from {}... ", input_dir);
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let start = Instant::now();
 
-    // Generate query vectors (different seed)
-    print!("Generating {} query vectors... ", args.num_queries);
-    std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    let queries = generate_random_vectors(args.num_queries, args.dimensions, args.seed + 1000);
-    println!("done");
+        match SPFreshIndex::load(input_dir) {
+            Ok(mut idx) => {
+                println!("done ({:.2}s)", start.elapsed().as_secs_f64());
 
-    // Build index
-    println!();
-    println!("--- Building Index ---");
-    let mut index = SPFreshIndex::new(config);
-    let start = Instant::now();
+                // Override num_probes from command line if specified
+                idx.set_num_probes(args.num_probes);
 
-    let report_interval = (args.num_vectors / 20).max(1000).min(args.num_vectors);
-    let mut last_report = Instant::now();
-
-    for (i, vector) in vectors.iter().enumerate() {
-        index.insert(i as u64, vector);
-
-        // Report every interval or every 2 seconds, whichever comes first
-        let should_report = (i + 1) % report_interval == 0
-            || last_report.elapsed().as_secs_f64() >= 2.0
-            || i + 1 == args.num_vectors;
-
-        if should_report && i > 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let rate = (i + 1) as f64 / elapsed;
-            let stats = index.stats();
-
-            // Use carriage return to overwrite the line
-            print!(
-                "\r  {:>6.1}% | {:>8} vecs | {:>5} centroids | {:>5} splits | {:>5} merges | {:>7} reassigned | {:>8.0} vec/s | {:.1}s   ",
-                (i + 1) as f64 / args.num_vectors as f64 * 100.0,
-                i + 1,
-                stats.num_centroids,
-                stats.num_splits,
-                stats.num_merges,
-                stats.num_reassigned,
-                rate,
-                elapsed
-            );
-            std::io::Write::flush(&mut std::io::stdout()).unwrap();
-            last_report = Instant::now();
+                let stats = idx.stats();
+                println!();
+                println!("Loaded index:");
+                println!("  Num centroids:      {:>10}", stats.num_centroids);
+                println!("  Total vectors:      {:>10}", stats.total_vectors);
+                println!("  Min posting size:   {:>10}", stats.min_posting_size);
+                println!("  Max posting size:   {:>10}", stats.max_posting_size);
+                println!("  Avg posting size:   {:>10.1}", stats.avg_posting_size);
+                println!("  Num probes:         {:>10} (from args)", args.num_probes);
+                idx
+            }
+            Err(e) => {
+                println!("FAILED: {}", e);
+                std::process::exit(1);
+            }
         }
-    }
-    let build_time = start.elapsed();
-    println!(); // New line after progress
+    } else {
+        // Build new index
+        println!("Configuration:");
+        println!("  Vectors:            {:>10}", args.num_vectors);
+        println!("  Dimensions:         {:>10}", args.dimensions);
+        println!("  Max posting size:   {:>10}", args.max_posting_size);
+        println!("  Min posting size:   {:>10}", args.min_posting_size);
+        println!("  Num probes:         {:>10}", args.num_probes);
+        println!("  Reassign neighbors: {:>10}", args.reassign_neighbors);
+        println!("  K-means iters:      {:>10}", args.kmeans_iters);
+        println!("  Num queries:        {:>10}", args.num_queries);
+        println!("  K (for k-NN):       {:>10}", args.k);
+        println!("  Seed:               {:>10}", args.seed);
+        println!();
 
-    println!();
-    let stats = index.stats();
-    println!("Build complete in {:.2}s ({:.0} vectors/sec)", build_time.as_secs_f64(), args.num_vectors as f64 / build_time.as_secs_f64());
-    println!("  Num centroids:      {:>10}", stats.num_centroids);
-    println!("  Total vectors:      {:>10}", stats.total_vectors);
-    println!("  Min posting size:   {:>10}", stats.min_posting_size);
-    println!("  Max posting size:   {:>10}", stats.max_posting_size);
-    println!("  Avg posting size:   {:>10.1}", stats.avg_posting_size);
-    println!("  Total splits:       {:>10}", stats.num_splits);
-    println!("  Total merges:       {:>10}", stats.num_merges);
-    println!("  Total reassigned:   {:>10}", stats.num_reassigned);
+        // Generate data
+        print!("Generating {} vectors... ", args.num_vectors);
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let start = Instant::now();
+        let vectors = generate_random_vectors(args.num_vectors, args.dimensions, args.seed);
+        println!("done ({:.2}s)", start.elapsed().as_secs_f64());
+
+        // Build index
+        println!();
+        println!("--- Building Index ---");
+        let mut idx = SPFreshIndex::new(config);
+        let start = Instant::now();
+
+        let report_interval = (args.num_vectors / 20).max(1000).min(args.num_vectors);
+        let mut last_report = Instant::now();
+
+        for (i, vector) in vectors.iter().enumerate() {
+            idx.insert(i as u64, vector);
+
+            // Report every interval or every 10 seconds, whichever comes first
+            let should_report = (i + 1) % report_interval == 0
+                || last_report.elapsed().as_secs_f64() >= 1.0
+                || i + 1 == args.num_vectors;
+
+            if should_report && i > 0 {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = (i + 1) as f64 / elapsed;
+                let stats = idx.stats();
+
+                // Use carriage return to overwrite the line
+                println!(
+                    "{:>6.1}% | {:>8} vecs | {:>5} centroids | {:>5} splits | {:>5} merges | {:>7} reassigned | {:>8.0} vec/s | {:.1}s",
+                    (i + 1) as f64 / args.num_vectors as f64 * 100.0,
+                    i + 1,
+                    stats.num_centroids,
+                    stats.num_splits,
+                    stats.num_merges,
+                    stats.num_reassigned,
+                    rate,
+                    elapsed
+                );
+                last_report = Instant::now();
+            }
+        }
+        let build_time = start.elapsed();
+        println!(); // New line after progress
+
+        println!();
+        let stats = idx.stats();
+        println!("Build complete in {:.2}s ({:.0} vectors/sec)", build_time.as_secs_f64(), args.num_vectors as f64 / build_time.as_secs_f64());
+        println!("  Num centroids:      {:>10}", stats.num_centroids);
+        println!("  Total vectors:      {:>10}", stats.total_vectors);
+        println!("  Min posting size:   {:>10}", stats.min_posting_size);
+        println!("  Max posting size:   {:>10}", stats.max_posting_size);
+        println!("  Avg posting size:   {:>10.1}", stats.avg_posting_size);
+        println!("  Total splits:       {:>10}", stats.num_splits);
+        println!("  Total merges:       {:>10}", stats.num_merges);
+        println!("  Total reassigned:   {:>10}", stats.num_reassigned);
+        idx
+    };
 
     // Save index if output directory specified
     if let Some(ref output_dir) = args.output_dir {
@@ -813,6 +1028,12 @@ fn main() {
         }
     }
 
+    // Generate query vectors (using index dimensions for compatibility with loaded indices)
+    print!("Generating {} query vectors... ", args.num_queries);
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let queries = generate_random_vectors(args.num_queries, index.dimensions(), args.seed + 1000);
+    println!("done");
+
     // Evaluate recall
     println!();
     println!("--- Evaluating Recall ---");
@@ -828,6 +1049,7 @@ fn main() {
 
         let exact = index.brute_force_search(query, args.k);
         let recall = compute_recall(&approximate, &exact);
+        println!("{:?}: query recall: {}", Instant::now(), recall);
         total_recall += recall;
     }
 
