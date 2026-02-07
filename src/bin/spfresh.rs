@@ -270,22 +270,24 @@ impl SPFreshIndex {
         (centroid1, centroid2)
     }
 
-    /// Reassign vectors from neighboring centroids that might be closer to this centroid
+    /// Reassign vectors from neighboring centroids that might be closer to this centroid.
+    /// Uses a heuristic: only search for true nearest if vector is closer to new centroid
+    /// than its current centroid.
     fn reassign_from_neighbors(&mut self, centroid_id: u64) {
         let centroid_vec = match self.centroid_vectors.get(&centroid_id) {
             Some(v) => v.clone(),
             None => return,
         };
 
-        // Find neighboring centroids
+        // Find neighboring centroids to check
         let neighbors = self
             .centroid_index
             .search(&centroid_vec, self.config.reassign_neighbors + 1)
             .expect("Search failed");
 
-        let mut to_reassign: Vec<(u64, StoredVector)> = Vec::new();
+        let mut to_reassign: Vec<(u64, u64, StoredVector)> = Vec::new(); // (from, to, vector)
 
-        // Check each neighbor's posting list for vectors closer to this centroid
+        // Check each neighbor's posting list
         for &neighbor_id in &neighbors.keys {
             if neighbor_id == centroid_id {
                 continue;
@@ -300,13 +302,22 @@ impl SPFreshIndex {
                 let mut i = 0;
                 while i < posting_list.len() {
                     let v = &posting_list[i];
-                    let dist_to_current = Self::l2_distance(&v.data, &centroid_vec);
-                    let dist_to_neighbor = Self::l2_distance(&v.data, &neighbor_vec);
+                    let dist_to_new = Self::l2_distance(&v.data, &centroid_vec);
+                    let dist_to_current = Self::l2_distance(&v.data, &neighbor_vec);
 
-                    if dist_to_current < dist_to_neighbor {
-                        // This vector should be reassigned
-                        let removed = posting_list.swap_remove(i);
-                        to_reassign.push((centroid_id, removed));
+                    // Heuristic: only search for true nearest if closer to new centroid
+                    if dist_to_new < dist_to_current {
+                        // Find the true nearest centroid for this vector
+                        let nearest = self.centroid_index.search(&v.data, 1).expect("Search failed");
+                        let nearest_centroid = nearest.keys[0];
+
+                        if nearest_centroid != neighbor_id {
+                            // Vector should be reassigned to its true nearest centroid
+                            let removed = posting_list.swap_remove(i);
+                            to_reassign.push((neighbor_id, nearest_centroid, removed));
+                        } else {
+                            i += 1;
+                        }
                     } else {
                         i += 1;
                     }
@@ -314,11 +325,25 @@ impl SPFreshIndex {
             }
         }
 
-        // Add reassigned vectors to this centroid's posting list
+        // Apply reassignments
         self.num_reassigned += to_reassign.len();
-        for (target_id, vector) in to_reassign {
-            self.posting_lists.entry(target_id).or_default().push(vector);
+        for (_from, to, vector) in to_reassign {
+            self.posting_lists.entry(to).or_default().push(vector);
         }
+    }
+
+    /// Reassign a batch of vectors to their true nearest centroids
+    /// Returns vectors grouped by their new centroid assignment
+    fn find_assignments(&self, vectors: Vec<StoredVector>) -> HashMap<u64, Vec<StoredVector>> {
+        let mut assignments: HashMap<u64, Vec<StoredVector>> = HashMap::new();
+
+        for v in vectors {
+            let nearest = self.centroid_index.search(&v.data, 1).expect("Search failed");
+            let nearest_centroid = nearest.keys[0];
+            assignments.entry(nearest_centroid).or_default().push(v);
+        }
+
+        assignments
     }
 
     /// Check if a centroid needs to be merged
@@ -333,70 +358,36 @@ impl SPFreshIndex {
         self.merge(centroid_id);
     }
 
-    /// Merge a centroid with its nearest neighbor that won't cause an immediate split
+    /// Merge a centroid by reassigning its vectors to their true nearest centroids
     fn merge(&mut self, centroid_id: u64) {
-        let centroid_vec = match self.centroid_vectors.get(&centroid_id) {
-            Some(v) => v.clone(),
-            None => return,
-        };
-
-        let my_size = self.posting_lists.get(&centroid_id).map(|l| l.len()).unwrap_or(0);
-
-        // Find nearest neighbors and pick one where merging won't trigger immediate split
-        let num_candidates = (self.centroid_vectors.len()).min(20); // Check up to 20 nearest
-        let neighbors = self.centroid_index
-            .search(&centroid_vec, num_candidates)
-            .expect("Search failed");
-
-        let mut neighbor_id = None;
-        for &candidate_id in &neighbors.keys {
-            if candidate_id == centroid_id {
-                continue;
-            }
-            let candidate_size = self.posting_lists.get(&candidate_id).map(|l| l.len()).unwrap_or(0);
-            // Only merge if combined size won't exceed max_posting_size
-            if my_size + candidate_size <= self.config.max_posting_size {
-                neighbor_id = Some(candidate_id);
-                break;
-            }
+        if !self.centroid_vectors.contains_key(&centroid_id) {
+            return;
         }
 
-        // If no suitable neighbor found, don't merge (avoid split-merge cycle)
-        let neighbor_id = match neighbor_id {
-            Some(id) => id,
-            None => return,
-        };
+        // Remove this centroid from the index first
+        let vectors = self.posting_lists.remove(&centroid_id).unwrap_or_default();
+        let _ = self.centroid_index.remove(centroid_id);
+        self.centroid_vectors.remove(&centroid_id);
+
+        if vectors.is_empty() {
+            return;
+        }
 
         self.num_merges += 1;
 
-        // Remove this centroid
-        let vectors = self.posting_lists.remove(&centroid_id).unwrap_or_default();
-        let _ = self.centroid_index.remove(centroid_id); // Ignore error, soft-delete is fine
-        self.centroid_vectors.remove(&centroid_id);
+        // Reassign each vector to its true nearest centroid
+        let num_reassigned = vectors.len();
+        let assignments = self.find_assignments(vectors);
 
-        // Get neighbor's existing vectors
-        let mut merged_vectors = self.posting_lists.remove(&neighbor_id).unwrap_or_default();
-        merged_vectors.extend(vectors);
+        // Add vectors to their new centroids
+        for (target_centroid, vecs) in assignments {
+            self.posting_lists.entry(target_centroid).or_default().extend(vecs);
+        }
 
-        // Compute new centroid position
-        let new_centroid = if !merged_vectors.is_empty() {
-            self.compute_centroid(&merged_vectors)
-        } else {
-            return;
-        };
+        self.num_reassigned += num_reassigned;
 
-        // Remove old neighbor from index (soft-delete)
-        let _ = self.centroid_index.remove(neighbor_id);
-        self.centroid_vectors.remove(&neighbor_id);
-
-        // Create new centroid with fresh ID (usearch remove is soft-delete, can't reuse IDs)
-        let new_id = self.next_centroid_id;
-        self.next_centroid_id += 1;
-
-        self.add_to_centroids_index(new_id, &new_centroid);
-        self.posting_lists.insert(new_id, merged_vectors);
-
-        // No need to check for split - we ensured merged size <= max_posting_size
+        // Note: We don't check for splits here to avoid cycles.
+        // Splits will happen naturally on the next insert if needed.
     }
 
     /// Compute centroid (mean) of vectors
