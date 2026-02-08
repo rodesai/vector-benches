@@ -320,6 +320,9 @@ impl SPFreshIndex {
     /// This means one of the new centroids is closer to v than the old centroid was.
     /// If true, v might now belong to one of the new centroids, so we search for the
     /// true nearest centroid.
+    ///
+    /// Per the SPFresh paper: "LIRE only examines nearby postings for reassignment check
+    /// by selecting several Ao's nearest postings" - we find neighbors of the OLD centroid.
     fn reassign_from_neighbors_spfresh(
         &mut self,
         new_id1: u64,
@@ -328,24 +331,19 @@ impl SPFreshIndex {
         centroid1: &[f32],
         centroid2: &[f32],
     ) {
-        // Find neighbors of both new centroids
-        let neighbors1 = self
+        // Find neighbors of the OLD centroid position (Ao)
+        // Note: Ao has been removed, but we search using its vector position.
+        // This will return the nearest centroids to where Ao was, including A1 and A2.
+        let neighbors = self
             .centroid_index
-            .search(centroid1, self.config.reassign_neighbors + 1)
-            .expect("Search failed");
-        let neighbors2 = self
-            .centroid_index
-            .search(centroid2, self.config.reassign_neighbors + 1)
+            .search(old_centroid, self.config.reassign_neighbors + 2)  // +2 to account for A1, A2
             .expect("Search failed");
 
-        // Combine and deduplicate neighbor IDs
-        let mut neighbor_ids: Vec<u64> = neighbors1.keys.iter()
-            .chain(neighbors2.keys.iter())
+        // Filter out the new centroids (A1 and A2) - we only want the neighboring postings
+        let neighbor_ids: Vec<u64> = neighbors.keys.iter()
             .copied()
             .filter(|&id| id != new_id1 && id != new_id2)
             .collect();
-        neighbor_ids.sort();
-        neighbor_ids.dedup();
 
         let mut to_reassign: Vec<(u64, u64, StoredVector)> = Vec::new(); // (from, to, vector)
 
