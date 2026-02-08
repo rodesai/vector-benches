@@ -527,6 +527,11 @@ impl SPFreshIndex {
         self.config.dimensions
     }
 
+    /// Get the configuration
+    pub fn config(&self) -> &SPFreshConfig {
+        &self.config
+    }
+
     /// Set the number of probes (for tuning recall after loading)
     pub fn set_num_probes(&mut self, num_probes: usize) {
         self.config.num_probes = num_probes;
@@ -1040,20 +1045,34 @@ fn main() {
             Ok(mut idx) => {
                 println!("done ({:.2}s)", start.elapsed().as_secs_f64());
 
+                // Print saved configuration
+                let saved_config = idx.config();
+                println!();
+                println!("Saved index configuration:");
+                println!("  Dimensions:         {:>10}", saved_config.dimensions);
+                println!("  Max posting size:   {:>10}", saved_config.max_posting_size);
+                println!("  Min posting size:   {:>10}", saved_config.min_posting_size);
+                println!("  Reassign neighbors: {:>10}", saved_config.reassign_neighbors);
+                println!("  K-means iters:      {:>10}", saved_config.kmeans_iters);
+                println!("  Connectivity:       {:>10}", saved_config.connectivity);
+                println!("  Expansion add:      {:>10}", saved_config.expansion_add);
+
                 // Override search parameters from command line
                 idx.set_num_probes(args.num_probes);
                 idx.set_expansion_search(args.expansion_search);
 
                 let stats = idx.stats();
                 println!();
-                println!("Loaded index:");
+                println!("Index stats:");
                 println!("  Num centroids:      {:>10}", stats.num_centroids);
                 println!("  Total vectors:      {:>10}", stats.total_vectors);
                 println!("  Min posting size:   {:>10}", stats.min_posting_size);
                 println!("  Max posting size:   {:>10}", stats.max_posting_size);
                 println!("  Avg posting size:   {:>10.1}", stats.avg_posting_size);
-                println!("  Num probes:         {:>10} (from args)", args.num_probes);
-                println!("  Expansion search:   {:>10} (from args)", args.expansion_search);
+                println!();
+                println!("Search parameters (from args):");
+                println!("  Num probes:         {:>10}", args.num_probes);
+                println!("  Expansion search:   {:>10}", args.expansion_search);
                 idx
             }
             Err(e) => {
