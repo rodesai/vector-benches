@@ -27,6 +27,12 @@ pub struct SPFreshConfig {
     pub reassign_neighbors: usize,
     /// K-means iterations for split
     pub kmeans_iters: usize,
+    /// HNSW connectivity (M parameter) - number of edges per node
+    pub connectivity: usize,
+    /// HNSW expansion factor during index construction
+    pub expansion_add: usize,
+    /// HNSW expansion factor during search
+    pub expansion_search: usize,
 }
 
 impl Default for SPFreshConfig {
@@ -38,6 +44,9 @@ impl Default for SPFreshConfig {
             num_probes: 10,
             reassign_neighbors: 5,
             kmeans_iters: 10,
+            connectivity: 16,
+            expansion_add: 128,
+            expansion_search: 64,
         }
     }
 }
@@ -78,9 +87,9 @@ impl SPFreshIndex {
             dimensions: config.dimensions,
             metric: MetricKind::L2sq,
             quantization: ScalarKind::F32,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 64,
+            connectivity: config.connectivity,
+            expansion_add: config.expansion_add,
+            expansion_search: config.expansion_search,
             multi: false,
         };
 
@@ -635,6 +644,9 @@ impl SPFreshIndex {
   "num_probes": {},
   "reassign_neighbors": {},
   "kmeans_iters": {},
+  "connectivity": {},
+  "expansion_add": {},
+  "expansion_search": {},
   "num_centroids": {},
   "total_vectors": {},
   "num_splits": {},
@@ -651,6 +663,9 @@ impl SPFreshIndex {
             self.config.num_probes,
             self.config.reassign_neighbors,
             self.config.kmeans_iters,
+            self.config.connectivity,
+            self.config.expansion_add,
+            self.config.expansion_search,
             stats.num_centroids,
             stats.total_vectors,
             stats.num_splits,
@@ -680,9 +695,9 @@ impl SPFreshIndex {
             dimensions: config.dimensions,
             metric: MetricKind::L2sq,
             quantization: ScalarKind::F32,
-            connectivity: 16,
-            expansion_add: 128,
-            expansion_search: 64,
+            connectivity: config.connectivity,
+            expansion_add: config.expansion_add,
+            expansion_search: config.expansion_search,
             multi: false,
         };
 
@@ -731,6 +746,11 @@ impl SPFreshIndex {
             })
         };
 
+        // Optional values with defaults (for backward compatibility)
+        let get_value_or_default = |key: &str, default: usize| -> usize {
+            get_value(key).unwrap_or(default)
+        };
+
         Ok(SPFreshConfig {
             dimensions: get_value("dimensions")?,
             max_posting_size: get_value("max_posting_size")?,
@@ -738,6 +758,9 @@ impl SPFreshIndex {
             num_probes: get_value("num_probes")?,
             reassign_neighbors: get_value("reassign_neighbors")?,
             kmeans_iters: get_value("kmeans_iters")?,
+            connectivity: get_value_or_default("connectivity", 16),
+            expansion_add: get_value_or_default("expansion_add", 128),
+            expansion_search: get_value_or_default("expansion_search", 64),
         })
     }
 
@@ -875,6 +898,18 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     kmeans_iters: usize,
 
+    /// HNSW connectivity (M parameter) - edges per node in centroid index
+    #[arg(long, default_value_t = 16)]
+    connectivity: usize,
+
+    /// HNSW expansion factor during index construction
+    #[arg(long, default_value_t = 128)]
+    expansion_add: usize,
+
+    /// HNSW expansion factor during search
+    #[arg(long, default_value_t = 64)]
+    expansion_search: usize,
+
     /// Number of queries for recall evaluation
     #[arg(long, default_value_t = 100)]
     num_queries: usize,
@@ -979,6 +1014,9 @@ fn main() {
         num_probes: args.num_probes,
         reassign_neighbors: args.reassign_neighbors,
         kmeans_iters: args.kmeans_iters,
+        connectivity: args.connectivity,
+        expansion_add: args.expansion_add,
+        expansion_search: args.expansion_search,
     };
 
     println!("=== SPFresh Index Benchmark ===");
