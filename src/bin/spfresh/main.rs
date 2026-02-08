@@ -532,6 +532,12 @@ impl SPFreshIndex {
         self.config.num_probes = num_probes;
     }
 
+    /// Set the HNSW expansion factor for search (for tuning recall after loading)
+    pub fn set_expansion_search(&mut self, expansion_search: usize) {
+        self.config.expansion_search = expansion_search;
+        self.centroid_index.change_expansion_search(expansion_search);
+    }
+
     /// Get index statistics
     pub fn stats(&self) -> IndexStats {
         let posting_sizes: Vec<usize> = self.posting_lists.values().map(|l| l.len()).collect();
@@ -1034,8 +1040,9 @@ fn main() {
             Ok(mut idx) => {
                 println!("done ({:.2}s)", start.elapsed().as_secs_f64());
 
-                // Override num_probes from command line if specified
+                // Override search parameters from command line
                 idx.set_num_probes(args.num_probes);
+                idx.set_expansion_search(args.expansion_search);
 
                 let stats = idx.stats();
                 println!();
@@ -1046,6 +1053,7 @@ fn main() {
                 println!("  Max posting size:   {:>10}", stats.max_posting_size);
                 println!("  Avg posting size:   {:>10.1}", stats.avg_posting_size);
                 println!("  Num probes:         {:>10} (from args)", args.num_probes);
+                println!("  Expansion search:   {:>10} (from args)", args.expansion_search);
                 idx
             }
             Err(e) => {
