@@ -1074,6 +1074,9 @@ fn main() {
         println!("  Num probes:         {:>10}", args.num_probes);
         println!("  Reassign neighbors: {:>10}", args.reassign_neighbors);
         println!("  K-means iters:      {:>10}", args.kmeans_iters);
+        println!("  Connectivity:       {:>10}", args.connectivity);
+        println!("  Expansion add:      {:>10}", args.expansion_add);
+        println!("  Expansion search:   {:>10}", args.expansion_search);
         println!("  Num queries:        {:>10}", args.num_queries);
         println!("  K (for k-NN):       {:>10}", args.k);
         println!("  Seed:               {:>10}", args.seed);
