@@ -783,6 +783,74 @@ impl SPFreshIndex {
         }
     }
 
+    /// Analyze compression ratio of random posting lists using zstd
+    /// Returns (num_postings_sampled, total_original_bytes, total_compressed_bytes, compression_ratio)
+    pub fn analyze_compression(&self, num_samples: usize, compression_level: i32) -> CompressionStats {
+        use rand::seq::SliceRandom;
+
+        let centroid_ids: Vec<u64> = self.posting_lists.keys().copied().collect();
+        let num_samples = num_samples.min(centroid_ids.len());
+
+        if num_samples == 0 {
+            return CompressionStats {
+                num_postings: 0,
+                total_vectors: 0,
+                original_bytes: 0,
+                compressed_bytes: 0,
+                compression_ratio: 1.0,
+            };
+        }
+
+        // Sample random posting lists
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
+        let mut sampled_ids = centroid_ids.clone();
+        sampled_ids.shuffle(&mut rng);
+        sampled_ids.truncate(num_samples);
+
+        let mut total_original: usize = 0;
+        let mut total_compressed: usize = 0;
+        let mut total_vectors: usize = 0;
+
+        for centroid_id in &sampled_ids {
+            if let Some(posting_list) = self.posting_lists.get(centroid_id) {
+                // Serialize the posting list to bytes (vector IDs + f32 data)
+                let mut raw_bytes: Vec<u8> = Vec::new();
+
+                for sv in posting_list {
+                    // Write vector ID (8 bytes)
+                    raw_bytes.extend_from_slice(&sv.id.to_le_bytes());
+                    // Write vector data (dimensions * 4 bytes)
+                    for &val in &sv.data {
+                        raw_bytes.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+
+                let original_size = raw_bytes.len();
+                total_original += original_size;
+                total_vectors += posting_list.len();
+
+                // Compress with zstd
+                let compressed = zstd::encode_all(raw_bytes.as_slice(), compression_level)
+                    .expect("zstd compression failed");
+                total_compressed += compressed.len();
+            }
+        }
+
+        let compression_ratio = if total_compressed > 0 {
+            total_original as f64 / total_compressed as f64
+        } else {
+            1.0
+        };
+
+        CompressionStats {
+            num_postings: num_samples,
+            total_vectors,
+            original_bytes: total_original,
+            compressed_bytes: total_compressed,
+            compression_ratio,
+        }
+    }
+
     /// Save the index to a directory
     pub fn save<P: AsRef<Path>>(&self, dir: P) -> std::io::Result<()> {
         let dir = dir.as_ref();
@@ -1145,6 +1213,15 @@ pub struct IndexStats {
     pub num_splits: usize,
     pub num_merges: usize,
     pub num_reassigned: usize,
+}
+
+/// Compression statistics for posting lists
+pub struct CompressionStats {
+    pub num_postings: usize,
+    pub total_vectors: usize,
+    pub original_bytes: usize,
+    pub compressed_bytes: usize,
+    pub compression_ratio: f64,
 }
 
 /// Search result with statistics
@@ -1575,4 +1652,25 @@ fn main() {
     println!("  P50 latency:        {:>10.3} ms", p50_latency);
     println!("  P99 latency:        {:>10.3} ms", p99_latency);
     println!("  QPS:                {:>10.1}", 1000.0 / avg_latency);
+
+    // Compression analysis
+    println!();
+    println!("--- Compression Analysis ---");
+    let comp_stats_info = index.stats();
+    let num_samples = 100.min(comp_stats_info.num_centroids);
+    print!("Analyzing {} random posting lists with zstd... ", num_samples);
+    std::io::stdout().flush().unwrap();
+    let comp_stats = index.analyze_compression(100, 3); // zstd level 3 (default)
+    println!("done");
+    println!();
+    println!("=== Compression Results ===");
+    println!("  Postings sampled:   {:>10}", comp_stats.num_postings);
+    println!("  Vectors in sample:  {:>10}", comp_stats.total_vectors);
+    println!("  Original size:      {:>10}", format_bytes(comp_stats.original_bytes));
+    println!("  Compressed size:    {:>10}", format_bytes(comp_stats.compressed_bytes));
+    println!("  Compression ratio:  {:>10.2}x", comp_stats.compression_ratio);
+    println!("  Bytes/vector (orig):{:>10.1}",
+        if comp_stats.total_vectors > 0 { comp_stats.original_bytes as f64 / comp_stats.total_vectors as f64 } else { 0.0 });
+    println!("  Bytes/vector (comp):{:>10.1}",
+        if comp_stats.total_vectors > 0 { comp_stats.compressed_bytes as f64 / comp_stats.total_vectors as f64 } else { 0.0 });
 }
