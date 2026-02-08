@@ -37,6 +37,13 @@ pub struct SPFreshConfig {
     /// Only search posting lists where: dist(q, centroid) <= (1 + epsilon) * dist(q, closest_centroid)
     /// Set to 0.0 to disable pruning (search all num_probes posting lists)
     pub pruning_threshold: f32,
+    /// Multi-cluster assignment threshold (epsilon1 from SPANN paper)
+    /// Assign vector to multiple clusters where: dist(v, c) <= (1 + epsilon1) * dist(v, closest_c)
+    /// Set to 0.0 to disable (single assignment). Typical values: 0.1-0.5
+    pub assignment_threshold: f32,
+    /// Maximum number of centroids a vector can be assigned to (caps replication)
+    /// Set to 0 for unlimited. Typical values: 4-16
+    pub max_assignment_count: usize,
 }
 
 impl Default for SPFreshConfig {
@@ -52,6 +59,8 @@ impl Default for SPFreshConfig {
             expansion_add: 128,
             expansion_search: 64,
             pruning_threshold: 0.0, // disabled by default
+            assignment_threshold: 0.0, // disabled by default (single assignment)
+            max_assignment_count: 0, // 0 = unlimited
         }
     }
 }
@@ -73,9 +82,14 @@ pub struct SPFreshIndex {
     posting_lists: HashMap<u64, Vec<StoredVector>>,
     /// Centroid vectors (needed for distance calculations and k-means)
     centroid_vectors: HashMap<u64, Vec<f32>>,
+    /// Vector assignments: vector_id -> set of centroid_ids it belongs to
+    /// Used for multi-cluster assignment (SPANN posting list expansion)
+    vector_assignments: HashMap<u64, HashSet<u64>>,
+    /// Vector data: vector_id -> vector data (canonical storage for deduplication)
+    vector_data: HashMap<u64, Vec<f32>>,
     /// Next centroid ID
     next_centroid_id: u64,
-    /// Total vectors in the index
+    /// Total vectors in the index (unique vectors, not posting list entries)
     total_vectors: usize,
     /// Number of splits performed
     num_splits: usize,
@@ -118,6 +132,8 @@ impl SPFreshIndex {
             centroid_index,
             posting_lists,
             centroid_vectors,
+            vector_assignments: HashMap::new(),
+            vector_data: HashMap::new(),
             next_centroid_id: 1,
             total_vectors: 0,
             num_splits: 0,
@@ -134,36 +150,169 @@ impl SPFreshIndex {
             "Vector dimension mismatch"
         );
 
-        // Find nearest centroid
-        let nearest = self
-            .centroid_index
-            .search(vector, 1)
-            .expect("Search failed");
-        let centroid_id = nearest.keys[0];
+        // Compute multi-cluster assignments (or single assignment if threshold is 0)
+        let assignments = self.compute_multi_assignments(vector);
 
-        // Add to posting list
-        self.posting_lists
-            .entry(centroid_id)
-            .or_default()
-            .push(StoredVector {
-                id,
-                data: vector.to_vec(),
-            });
+        // Add to posting lists and tracking structures
+        self.add_vector_to_assignments(id, vector.to_vec(), assignments.clone());
         self.total_vectors += 1;
 
-        // Check if split is needed
-        if self.posting_lists[&centroid_id].len() > self.config.max_posting_size {
-            self.split(centroid_id);
+        // Check if any assigned centroid needs splitting
+        for centroid_id in assignments {
+            if self.posting_lists.get(&centroid_id).map(|l| l.len()).unwrap_or(0)
+                > self.config.max_posting_size
+            {
+                self.split(centroid_id);
+            }
         }
     }
 
     fn add_to_centroids_index(&mut self, id: u64, v: &[f32]) {
-        if let Err(e) = self.centroid_index.add(id, &v) {
+        if let Err(_e) = self.centroid_index.add(id, v) {
             println!("RESERVING: {}", self.centroid_vectors.len() + 1024);
             self.centroid_index.reserve(self.centroid_vectors.len() + 1024).expect("Failed to reserve");
-            self.centroid_index.add(id, &v).expect("Failed to add to index");
+            self.centroid_index.add(id, v).expect("Failed to add to index");
         }
         self.centroid_vectors.insert(id, v.into());
+    }
+
+    /// Compute multi-cluster assignments for a vector using SPANN posting list expansion.
+    /// Returns the set of centroid IDs the vector should be assigned to.
+    ///
+    /// Uses two rules from the SPANN paper:
+    /// 1. Distance threshold: assign to cluster c if dist(v, c) <= (1 + ε) * dist(v, closest_c)
+    /// 2. RNG rule: skip cluster c_j if dist(c_j, v) > dist(c_{j-1}, c_j) to avoid redundant
+    ///    assignments to nearby clusters that would likely be searched together
+    fn compute_multi_assignments(&self, vector: &[f32]) -> HashSet<u64> {
+        let threshold = self.config.assignment_threshold;
+
+        // If threshold is 0, just return single nearest centroid
+        if threshold <= 0.0 {
+            let nearest = self.centroid_index.search(vector, 1).expect("Search failed");
+            let mut result = HashSet::new();
+            result.insert(nearest.keys[0]);
+            return result;
+        }
+
+        // Search for more centroids than we'll likely assign (to have candidates for RNG filtering)
+        let num_candidates = (self.config.num_probes * 2).min(self.centroid_vectors.len());
+        let search_results = self.centroid_index.search(vector, num_candidates).expect("Search failed");
+
+        if search_results.keys.is_empty() {
+            return HashSet::new();
+        }
+
+        let min_dist = search_results.distances[0];
+        let dist_threshold = (1.0 + threshold) * min_dist;
+
+        // Collect candidates that pass the distance threshold
+        let mut candidates: Vec<(u64, f32)> = Vec::new();
+        for (i, &centroid_id) in search_results.keys.iter().enumerate() {
+            let dist = search_results.distances[i];
+            if dist <= dist_threshold {
+                candidates.push((centroid_id, dist));
+            }
+        }
+
+        // Simple multi-cluster assignment: include all centroids within the distance threshold
+        // Optionally limited by max_assignment_count
+        let mut result = HashSet::new();
+        let max_count = if self.config.max_assignment_count > 0 {
+            self.config.max_assignment_count
+        } else {
+            usize::MAX
+        };
+
+        for (centroid_id, _) in &candidates {
+            if result.len() >= max_count {
+                break;
+            }
+            result.insert(*centroid_id);
+        }
+
+        result
+    }
+
+    /// Remove a vector from all its current posting lists.
+    /// Returns the vector data if found.
+    fn remove_vector_from_all_postings(&mut self, vector_id: u64) -> Option<Vec<f32>> {
+        // Get current assignments
+        let assignments = match self.vector_assignments.remove(&vector_id) {
+            Some(a) => a,
+            None => return self.vector_data.remove(&vector_id),
+        };
+
+        // Remove from all posting lists
+        for centroid_id in assignments {
+            if let Some(posting_list) = self.posting_lists.get_mut(&centroid_id) {
+                if let Some(pos) = posting_list.iter().position(|v| v.id == vector_id) {
+                    posting_list.swap_remove(pos);
+                }
+            }
+        }
+
+        // Return and remove from vector_data
+        self.vector_data.remove(&vector_id)
+    }
+
+    /// Add a vector to posting lists based on computed assignments.
+    /// Updates vector_assignments and vector_data.
+    fn add_vector_to_assignments(&mut self, vector_id: u64, vector: Vec<f32>, assignments: HashSet<u64>) {
+        // Store canonical vector data
+        self.vector_data.insert(vector_id, vector.clone());
+
+        // Add to each assigned posting list
+        for &centroid_id in &assignments {
+            self.posting_lists
+                .entry(centroid_id)
+                .or_default()
+                .push(StoredVector {
+                    id: vector_id,
+                    data: vector.clone(),
+                });
+        }
+
+        // Store assignments
+        self.vector_assignments.insert(vector_id, assignments);
+    }
+
+    /// Recompute assignments for a vector and update posting lists.
+    /// Used during reassignment after split/merge.
+    fn recompute_vector_assignments(&mut self, vector_id: u64) {
+        // Get vector data (don't remove yet in case recompute fails)
+        let vector = match self.vector_data.get(&vector_id) {
+            Some(v) => v.clone(),
+            None => return,
+        };
+
+        // Compute new assignments
+        let new_assignments = self.compute_multi_assignments(&vector);
+
+        // Get old assignments
+        let old_assignments = self.vector_assignments.get(&vector_id).cloned().unwrap_or_default();
+
+        // Remove from posting lists that are no longer assigned
+        for centroid_id in old_assignments.difference(&new_assignments) {
+            if let Some(posting_list) = self.posting_lists.get_mut(centroid_id) {
+                if let Some(pos) = posting_list.iter().position(|v| v.id == vector_id) {
+                    posting_list.swap_remove(pos);
+                }
+            }
+        }
+
+        // Add to posting lists that are newly assigned
+        for &centroid_id in new_assignments.difference(&old_assignments) {
+            self.posting_lists
+                .entry(centroid_id)
+                .or_default()
+                .push(StoredVector {
+                    id: vector_id,
+                    data: vector.clone(),
+                });
+        }
+
+        // Update assignments
+        self.vector_assignments.insert(vector_id, new_assignments);
     }
 
     /// Split a centroid into two using k-means
@@ -185,6 +334,16 @@ impl SPFreshIndex {
             None => return,
         };
 
+        // Collect unique vector IDs from this posting (for multi-cluster, track which vectors need recomputation)
+        let vector_ids: Vec<u64> = vectors.iter().map(|v| v.id).collect();
+
+        // Remove the old centroid from each vector's assignment set
+        for &vid in &vector_ids {
+            if let Some(assignments) = self.vector_assignments.get_mut(&vid) {
+                assignments.remove(&centroid_id);
+            }
+        }
+
         // Run k-means to find 2 new centroids
         let (centroid1, centroid2) = self.kmeans_2(&vectors);
         self.num_splits += 1;
@@ -202,59 +361,57 @@ impl SPFreshIndex {
         self.add_to_centroids_index(new_id1, &centroid1);
         self.add_to_centroids_index(new_id2, &centroid2);
 
-        // Assign vectors to new centroids, tracking those that might need reassignment
-        // SPFresh Condition 1: vectors where D(v, Ao) <= D(v, A1) AND D(v, Ao) <= D(v, A2)
-        let mut list1 = Vec::new();
-        let mut list2 = Vec::new();
-        let mut condition1_candidates: Vec<(u64, StoredVector)> = Vec::new();
+        // Initialize empty posting lists for new centroids
+        self.posting_lists.insert(new_id1, Vec::new());
+        self.posting_lists.insert(new_id2, Vec::new());
 
+        // Track vectors that need full reassignment check (SPFresh Condition 1)
+        let mut condition1_candidates: Vec<u64> = Vec::new();
+
+        // Assign vectors from the old posting to the closer of the two new centroids
+        // This is the same for both single and multi-cluster modes per SPFresh paper
         for v in vectors {
             let dist_to_old = Self::l2_distance(&v.data, &old_centroid);
             let dist1 = Self::l2_distance(&v.data, &centroid1);
             let dist2 = Self::l2_distance(&v.data, &centroid2);
 
             // Assign to closer of the two new centroids
-            let assigned_id = if dist1 <= dist2 {
-                list1.push(v.clone());
-                new_id1
-            } else {
-                list2.push(v.clone());
-                new_id2
-            };
+            let assigned_id = if dist1 <= dist2 { new_id1 } else { new_id2 };
+            self.posting_lists.get_mut(&assigned_id).unwrap().push(v.clone());
+
+            // Update vector_assignments: add the new centroid
+            // (old centroid was already removed above)
+            let assignments = self.vector_assignments.entry(v.id).or_default();
+            assignments.insert(assigned_id);
 
             // Condition 1: if old centroid was closer than BOTH new ones,
             // vector might belong to a neighboring centroid
             if dist_to_old <= dist1 && dist_to_old <= dist2 {
-                condition1_candidates.push((assigned_id, v));
+                condition1_candidates.push(v.id);
             }
         }
 
-        self.posting_lists.insert(new_id1, list1);
-        self.posting_lists.insert(new_id2, list2);
+        // Collect Condition 2 candidates: vectors from neighboring centroids that might need reassignment
+        let condition2_candidates = self.collect_condition2_candidates(
+            new_id1, new_id2, &old_centroid, &centroid1, &centroid2
+        );
 
-        // Process Condition 1: check if vectors from old posting belong elsewhere
-        let mut to_reassign: Vec<(u64, u64, StoredVector)> = Vec::new();
-        for (current_id, v) in condition1_candidates {
-            let nearest = self.centroid_index.search(&v.data, 1).expect("Search failed");
-            let nearest_centroid = nearest.keys[0];
-            if nearest_centroid != current_id {
-                to_reassign.push((current_id, nearest_centroid, v));
+        // Merge both conditions and deduplicate
+        let mut all_candidates: Vec<u64> = condition1_candidates;
+        all_candidates.extend(condition2_candidates);
+        all_candidates.sort();
+        all_candidates.dedup();
+
+        // Recompute assignments for all candidate vectors (handles both single and multi-cluster)
+        for vid in all_candidates {
+            let old_assignments = self.vector_assignments.get(&vid).cloned().unwrap_or_default();
+            self.recompute_vector_assignments(vid);
+            let new_assignments = self.vector_assignments.get(&vid).cloned().unwrap_or_default();
+
+            if old_assignments != new_assignments {
+                self.num_reassigned += 1;
             }
         }
-
-        // Apply Condition 1 reassignments
-        for (from_id, to_id, v) in to_reassign {
-            if let Some(list) = self.posting_lists.get_mut(&from_id) {
-                if let Some(pos) = list.iter().position(|x| x.id == v.id) {
-                    list.swap_remove(pos);
-                    self.posting_lists.entry(to_id).or_default().push(v);
-                    self.num_reassigned += 1;
-                }
-            }
-        }
-
-        // Process Condition 2: check neighboring centroids
-        self.reassign_from_neighbors_spfresh(new_id1, new_id2, &old_centroid, &centroid1, &centroid2);
 
         // Check if new centroids need merging (unlikely after split, but for consistency)
         self.check_merge(new_id1);
@@ -326,25 +483,24 @@ impl SPFreshIndex {
         (centroid1, centroid2)
     }
 
-    /// SPFresh Condition 2: Reassign vectors from neighboring centroids after a split.
+    /// SPFresh Condition 2: Collect vectors from neighboring centroids that might need reassignment.
     ///
     /// For each vector v in a neighboring posting (centroid B), check if:
     ///   min(D(v, A1), D(v, A2)) <= D(v, Ao)
     ///
     /// This means one of the new centroids is closer to v than the old centroid was.
-    /// If true, v might now belong to one of the new centroids, so we search for the
-    /// true nearest centroid.
+    /// Returns the vector IDs that should be checked for reassignment.
     ///
     /// Per the SPFresh paper: "LIRE only examines nearby postings for reassignment check
     /// by selecting several Ao's nearest postings" - we find neighbors of the OLD centroid.
-    fn reassign_from_neighbors_spfresh(
-        &mut self,
+    fn collect_condition2_candidates(
+        &self,
         new_id1: u64,
         new_id2: u64,
         old_centroid: &[f32],
         centroid1: &[f32],
         centroid2: &[f32],
-    ) {
+    ) -> Vec<u64> {
         // Find neighbors of the OLD centroid position (Ao)
         // Note: Ao has been removed, but we search using its vector position.
         // This will return the nearest centroids to where Ao was, including A1 and A2.
@@ -359,45 +515,28 @@ impl SPFreshIndex {
             .filter(|&id| id != new_id1 && id != new_id2)
             .collect();
 
-        let mut to_reassign: Vec<(u64, u64, StoredVector)> = Vec::new(); // (from, to, vector)
+        // Collect vector IDs that need reassignment check
+        let mut candidates: Vec<u64> = Vec::new();
 
         // Check each neighbor's posting list
         for neighbor_id in neighbor_ids {
-            if let Some(posting_list) = self.posting_lists.get_mut(&neighbor_id) {
-                let mut i = 0;
-                while i < posting_list.len() {
-                    let v = &posting_list[i];
+            if let Some(posting_list) = self.posting_lists.get(&neighbor_id) {
+                for v in posting_list {
                     let dist_to_old = Self::l2_distance(&v.data, old_centroid);
                     let dist_to_new1 = Self::l2_distance(&v.data, centroid1);
                     let dist_to_new2 = Self::l2_distance(&v.data, centroid2);
                     let min_dist_to_new = dist_to_new1.min(dist_to_new2);
 
                     // Condition 2: if either new centroid is closer than the old centroid,
-                    // check if v should be reassigned
+                    // this vector might need reassignment
                     if min_dist_to_new <= dist_to_old {
-                        // Find the true nearest centroid for this vector
-                        let nearest = self.centroid_index.search(&v.data, 1).expect("Search failed");
-                        let nearest_centroid = nearest.keys[0];
-
-                        if nearest_centroid != neighbor_id {
-                            // Vector should be reassigned to its true nearest centroid
-                            let removed = posting_list.swap_remove(i);
-                            to_reassign.push((neighbor_id, nearest_centroid, removed));
-                        } else {
-                            i += 1;
-                        }
-                    } else {
-                        i += 1;
+                        candidates.push(v.id);
                     }
                 }
             }
         }
 
-        // Apply reassignments
-        self.num_reassigned += to_reassign.len();
-        for (_from, to, vector) in to_reassign {
-            self.posting_lists.entry(to).or_default().push(vector);
-        }
+        candidates
     }
 
     /// Reassign a batch of vectors to their true nearest centroids
@@ -443,13 +582,24 @@ impl SPFreshIndex {
 
         self.num_merges += 1;
 
-        // Reassign each vector to its true nearest centroid
-        let num_reassigned = vectors.len();
-        let assignments = self.find_assignments(vectors);
+        // Collect unique vector IDs and remove the merged centroid from their assignments
+        let vector_ids: Vec<u64> = vectors.iter().map(|v| v.id).collect();
+        for &vid in &vector_ids {
+            if let Some(assignments) = self.vector_assignments.get_mut(&vid) {
+                assignments.remove(&centroid_id);
+            }
+        }
 
-        // Add vectors to their new centroids
-        for (target_centroid, vecs) in assignments {
-            self.posting_lists.entry(target_centroid).or_default().extend(vecs);
+        // Recompute assignments for each vector
+        let mut num_reassigned = 0;
+        for vid in vector_ids {
+            let old_assignments = self.vector_assignments.get(&vid).cloned().unwrap_or_default();
+            self.recompute_vector_assignments(vid);
+            let new_assignments = self.vector_assignments.get(&vid).cloned().unwrap_or_default();
+
+            if old_assignments != new_assignments {
+                num_reassigned += 1;
+            }
         }
 
         self.num_reassigned += num_reassigned;
@@ -520,29 +670,50 @@ impl SPFreshIndex {
             }
         }
 
+        // Deduplicate candidates (same vector may appear in multiple posting lists with multi-cluster)
+        // Keep the entry with the smallest distance for each vector ID
+        let mut seen: HashMap<u64, f32> = HashMap::new();
+        for (id, dist) in candidates {
+            seen.entry(id)
+                .and_modify(|d| *d = d.min(dist))
+                .or_insert(dist);
+        }
+        let mut deduped: Vec<(u64, f32)> = seen.into_iter().collect();
+
         // Sort by distance and return top k
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        candidates.truncate(k);
+        deduped.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        deduped.truncate(k);
         SearchResult {
-            neighbors: candidates,
+            neighbors: deduped,
             probes_searched,
         }
     }
 
     /// Brute force search (for computing recall)
     pub fn brute_force_search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let mut all_vectors: Vec<(u64, f32)> = Vec::new();
-
-        for posting_list in self.posting_lists.values() {
-            for v in posting_list {
-                let dist = Self::l2_distance(query, &v.data);
-                all_vectors.push((v.id, dist));
+        // Use vector_data for canonical deduplication if available, otherwise fall back to posting lists
+        let all_vectors: Vec<(u64, f32)> = if !self.vector_data.is_empty() {
+            self.vector_data.iter()
+                .map(|(&id, data)| (id, Self::l2_distance(query, data)))
+                .collect()
+        } else {
+            // Deduplicate from posting lists
+            let mut seen: HashMap<u64, f32> = HashMap::new();
+            for posting_list in self.posting_lists.values() {
+                for v in posting_list {
+                    let dist = Self::l2_distance(query, &v.data);
+                    seen.entry(v.id)
+                        .and_modify(|d| *d = d.min(dist))
+                        .or_insert(dist);
+                }
             }
-        }
+            seen.into_iter().collect()
+        };
 
-        all_vectors.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        all_vectors.truncate(k);
-        all_vectors
+        let mut sorted = all_vectors;
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        sorted.truncate(k);
+        sorted
     }
 
     /// Compute L2 squared distance
@@ -584,18 +755,28 @@ impl SPFreshIndex {
         let posting_sizes: Vec<usize> = self.posting_lists.values().map(|l| l.len()).collect();
         let min_size = posting_sizes.iter().min().copied().unwrap_or(0);
         let max_size = posting_sizes.iter().max().copied().unwrap_or(0);
+        let total_posting_entries: usize = posting_sizes.iter().sum();
         let avg_size = if posting_sizes.is_empty() {
             0.0
         } else {
-            posting_sizes.iter().sum::<usize>() as f64 / posting_sizes.len() as f64
+            total_posting_entries as f64 / posting_sizes.len() as f64
+        };
+
+        // Replication factor: avg number of posting lists per vector
+        let replication_factor = if self.total_vectors > 0 {
+            total_posting_entries as f64 / self.total_vectors as f64
+        } else {
+            1.0
         };
 
         IndexStats {
             num_centroids: self.centroid_vectors.len(),
             total_vectors: self.total_vectors,
+            total_posting_entries,
             min_posting_size: min_size,
             max_posting_size: max_size,
             avg_posting_size: avg_size,
+            replication_factor,
             num_splits: self.num_splits,
             num_merges: self.num_merges,
             num_reassigned: self.num_reassigned,
@@ -652,17 +833,23 @@ impl SPFreshIndex {
     }
 
     /// Save all vectors with their centroid assignments as binary
+    /// With multi-cluster assignment, the same vector may appear in multiple posting lists
     fn save_vectors<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
-        // Write header: total_vectors, dimensions
-        let total_vectors = self.total_vectors as u64;
+        // Count total posting entries (includes duplicates for multi-cluster)
+        let total_posting_entries: u64 = self.posting_lists.values()
+            .map(|l| l.len() as u64)
+            .sum();
         let dimensions = self.config.dimensions as u64;
-        writer.write_all(&total_vectors.to_le_bytes())?;
-        writer.write_all(&dimensions.to_le_bytes())?;
 
-        // Write each vector: centroid_id (u64), vector_id (u64), vector (f32 * dimensions)
+        // Write header: total_posting_entries, dimensions, total_unique_vectors
+        writer.write_all(&total_posting_entries.to_le_bytes())?;
+        writer.write_all(&dimensions.to_le_bytes())?;
+        writer.write_all(&(self.total_vectors as u64).to_le_bytes())?;
+
+        // Write each posting entry: centroid_id (u64), vector_id (u64), vector (f32 * dimensions)
         for (&centroid_id, posting_list) in &self.posting_lists {
             for stored in posting_list {
                 writer.write_all(&centroid_id.to_le_bytes())?;
@@ -695,8 +882,12 @@ impl SPFreshIndex {
   "expansion_add": {},
   "expansion_search": {},
   "pruning_threshold": {},
+  "assignment_threshold": {},
+  "max_assignment_count": {},
   "num_centroids": {},
   "total_vectors": {},
+  "total_posting_entries": {},
+  "replication_factor": {:.2},
   "num_splits": {},
   "num_merges": {},
   "num_reassigned": {},
@@ -715,8 +906,12 @@ impl SPFreshIndex {
             self.config.expansion_add,
             self.config.expansion_search,
             self.config.pruning_threshold,
+            self.config.assignment_threshold,
+            self.config.max_assignment_count,
             stats.num_centroids,
             stats.total_vectors,
+            stats.total_posting_entries,
+            stats.replication_factor,
             stats.num_splits,
             stats.num_merges,
             stats.num_reassigned,
@@ -767,11 +962,24 @@ impl SPFreshIndex {
         let (posting_lists, total_vectors, next_centroid_id) =
             Self::load_vectors(&vectors_path, config.dimensions)?;
 
+        // Reconstruct vector_assignments and vector_data from posting lists
+        let mut vector_assignments: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut vector_data: HashMap<u64, Vec<f32>> = HashMap::new();
+        for (&centroid_id, posting_list) in &posting_lists {
+            for v in posting_list {
+                vector_assignments.entry(v.id).or_default().insert(centroid_id);
+                // Store vector data (may overwrite with same data if multi-cluster)
+                vector_data.entry(v.id).or_insert_with(|| v.data.clone());
+            }
+        }
+
         Ok(Self {
             config,
             centroid_index,
             posting_lists,
             centroid_vectors,
+            vector_assignments,
+            vector_data,
             next_centroid_id,
             total_vectors,
             num_splits: 0,
@@ -828,6 +1036,8 @@ impl SPFreshIndex {
             expansion_add: get_value_or_default("expansion_add", 128),
             expansion_search: get_value_or_default("expansion_search", 64),
             pruning_threshold: get_float_or_default("pruning_threshold", 0.0),
+            assignment_threshold: get_float_or_default("assignment_threshold", 0.0),
+            max_assignment_count: get_value_or_default("max_assignment_count", 0),
         })
     }
 
@@ -871,12 +1081,14 @@ impl SPFreshIndex {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        // Read header
+        // Read header: total_posting_entries, dimensions, total_unique_vectors
         let mut buf8 = [0u8; 8];
         reader.read_exact(&mut buf8)?;
-        let total_vectors = u64::from_le_bytes(buf8) as usize;
+        let total_posting_entries = u64::from_le_bytes(buf8) as usize;
         reader.read_exact(&mut buf8)?;
         let file_dimensions = u64::from_le_bytes(buf8) as usize;
+        reader.read_exact(&mut buf8)?;
+        let total_vectors = u64::from_le_bytes(buf8) as usize;
 
         if file_dimensions != dimensions {
             return Err(std::io::Error::new(
@@ -889,7 +1101,8 @@ impl SPFreshIndex {
         let mut max_centroid_id: u64 = 0;
         let mut buf4 = [0u8; 4];
 
-        for _ in 0..total_vectors {
+        // Read all posting entries (may include same vector in multiple lists)
+        for _ in 0..total_posting_entries {
             // Read centroid ID
             reader.read_exact(&mut buf8)?;
             let centroid_id = u64::from_le_bytes(buf8);
@@ -924,9 +1137,11 @@ impl SPFreshIndex {
 pub struct IndexStats {
     pub num_centroids: usize,
     pub total_vectors: usize,
+    pub total_posting_entries: usize,
     pub min_posting_size: usize,
     pub max_posting_size: usize,
     pub avg_posting_size: f64,
+    pub replication_factor: f64,
     pub num_splits: usize,
     pub num_merges: usize,
     pub num_reassigned: usize,
@@ -990,6 +1205,17 @@ struct Args {
     /// Set to 0.0 to disable (default). Try 0.5-2.0 for recall@10, 0.1-0.6 for recall@1
     #[arg(long, default_value_t = 0.0)]
     pruning_threshold: f32,
+
+    /// Multi-cluster assignment threshold (epsilon1 from SPANN paper)
+    /// Assign vector to multiple clusters where: dist(v, c) <= (1 + epsilon) * dist(v, closest)
+    /// Set to 0.0 to disable (default, single assignment). Try 0.1-0.5 for better recall
+    #[arg(long, default_value_t = 0.0)]
+    assignment_threshold: f32,
+
+    /// Maximum number of centroids a vector can be assigned to (caps replication)
+    /// Set to 0 for unlimited (default). Typical values: 4-16
+    #[arg(long, default_value_t = 0)]
+    max_assignment_count: usize,
 
     /// Number of queries for recall evaluation
     #[arg(long, default_value_t = 100)]
@@ -1099,6 +1325,8 @@ fn main() {
         expansion_add: args.expansion_add,
         expansion_search: args.expansion_search,
         pruning_threshold: args.pruning_threshold,
+        assignment_threshold: args.assignment_threshold,
+        max_assignment_count: args.max_assignment_count,
     };
 
     println!("=== SPFresh Index Benchmark ===");
@@ -1128,6 +1356,8 @@ fn main() {
                 println!("  Connectivity:       {:>10}", saved_config.connectivity);
                 println!("  Expansion add:      {:>10}", saved_config.expansion_add);
                 println!("  Pruning (saved):    {:>10.2}", saved_config.pruning_threshold);
+                println!("  Assignment (saved): {:>10.2}", saved_config.assignment_threshold);
+                println!("  Max assign (saved): {:>10}", if saved_config.max_assignment_count == 0 { "unlimited".to_string() } else { saved_config.max_assignment_count.to_string() });
 
                 // Override search parameters from command line
                 idx.set_num_probes(args.num_probes);
@@ -1139,6 +1369,8 @@ fn main() {
                 println!("Index stats:");
                 println!("  Num centroids:      {:>10}", stats.num_centroids);
                 println!("  Total vectors:      {:>10}", stats.total_vectors);
+                println!("  Posting entries:    {:>10}", stats.total_posting_entries);
+                println!("  Replication factor: {:>10.2}", stats.replication_factor);
                 println!("  Min posting size:   {:>10}", stats.min_posting_size);
                 println!("  Max posting size:   {:>10}", stats.max_posting_size);
                 println!("  Avg posting size:   {:>10.1}", stats.avg_posting_size);
@@ -1171,6 +1403,8 @@ fn main() {
         println!("  Expansion add:      {:>10}", args.expansion_add);
         println!("  Expansion search:   {:>10}", args.expansion_search);
         println!("  Pruning threshold:  {:>10.2}", args.pruning_threshold);
+        println!("  Assignment thresh:  {:>10.2}", args.assignment_threshold);
+        println!("  Max assignments:    {:>10}", if args.max_assignment_count == 0 { "unlimited".to_string() } else { args.max_assignment_count.to_string() });
         println!("  Num queries:        {:>10}", args.num_queries);
         println!("  K (for k-NN):       {:>10}", args.k);
         println!("  Seed:               {:>10}", args.seed);
@@ -1234,6 +1468,8 @@ fn main() {
         println!("Build complete in {:.2}s ({:.0} vectors/sec)", build_time.as_secs_f64(), num_vectors as f64 / build_time.as_secs_f64());
         println!("  Num centroids:      {:>10}", stats.num_centroids);
         println!("  Total vectors:      {:>10}", stats.total_vectors);
+        println!("  Posting entries:    {:>10}", stats.total_posting_entries);
+        println!("  Replication factor: {:>10.2}", stats.replication_factor);
         println!("  Min posting size:   {:>10}", stats.min_posting_size);
         println!("  Max posting size:   {:>10}", stats.max_posting_size);
         println!("  Avg posting size:   {:>10.1}", stats.avg_posting_size);
