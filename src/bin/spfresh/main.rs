@@ -165,6 +165,12 @@ impl SPFreshIndex {
             return;
         }
 
+        // Save old centroid before removing (needed for SPFresh reassignment conditions)
+        let old_centroid = match self.centroid_vectors.get(&centroid_id) {
+            Some(v) => v.clone(),
+            None => return,
+        };
+
         // Run k-means to find 2 new centroids
         let (centroid1, centroid2) = self.kmeans_2(&vectors);
         self.num_splits += 1;
@@ -182,26 +188,59 @@ impl SPFreshIndex {
         self.add_to_centroids_index(new_id1, &centroid1);
         self.add_to_centroids_index(new_id2, &centroid2);
 
-        // Assign vectors to new centroids
+        // Assign vectors to new centroids, tracking those that might need reassignment
+        // SPFresh Condition 1: vectors where D(v, Ao) <= D(v, A1) AND D(v, Ao) <= D(v, A2)
         let mut list1 = Vec::new();
         let mut list2 = Vec::new();
+        let mut condition1_candidates: Vec<(u64, StoredVector)> = Vec::new();
 
         for v in vectors {
+            let dist_to_old = Self::l2_distance(&v.data, &old_centroid);
             let dist1 = Self::l2_distance(&v.data, &centroid1);
             let dist2 = Self::l2_distance(&v.data, &centroid2);
-            if dist1 <= dist2 {
-                list1.push(v);
+
+            // Assign to closer of the two new centroids
+            let assigned_id = if dist1 <= dist2 {
+                list1.push(v.clone());
+                new_id1
             } else {
-                list2.push(v);
+                list2.push(v.clone());
+                new_id2
+            };
+
+            // Condition 1: if old centroid was closer than BOTH new ones,
+            // vector might belong to a neighboring centroid
+            if dist_to_old <= dist1 && dist_to_old <= dist2 {
+                condition1_candidates.push((assigned_id, v));
             }
         }
 
         self.posting_lists.insert(new_id1, list1);
         self.posting_lists.insert(new_id2, list2);
 
-        // Reassign vectors from neighboring centroids (SPFresh key insight)
-        self.reassign_from_neighbors(new_id1);
-        self.reassign_from_neighbors(new_id2);
+        // Process Condition 1: check if vectors from old posting belong elsewhere
+        let mut to_reassign: Vec<(u64, u64, StoredVector)> = Vec::new();
+        for (current_id, v) in condition1_candidates {
+            let nearest = self.centroid_index.search(&v.data, 1).expect("Search failed");
+            let nearest_centroid = nearest.keys[0];
+            if nearest_centroid != current_id {
+                to_reassign.push((current_id, nearest_centroid, v));
+            }
+        }
+
+        // Apply Condition 1 reassignments
+        for (from_id, to_id, v) in to_reassign {
+            if let Some(list) = self.posting_lists.get_mut(&from_id) {
+                if let Some(pos) = list.iter().position(|x| x.id == v.id) {
+                    list.swap_remove(pos);
+                    self.posting_lists.entry(to_id).or_default().push(v);
+                    self.num_reassigned += 1;
+                }
+            }
+        }
+
+        // Process Condition 2: check neighboring centroids
+        self.reassign_from_neighbors_spfresh(new_id1, new_id2, &old_centroid, &centroid1, &centroid2);
 
         // Check if new centroids need merging (unlikely after split, but for consistency)
         self.check_merge(new_id1);
@@ -273,43 +312,57 @@ impl SPFreshIndex {
         (centroid1, centroid2)
     }
 
-    /// Reassign vectors from neighboring centroids that might be closer to this centroid.
-    /// Uses a heuristic: only search for true nearest if vector is closer to new centroid
-    /// than its current centroid.
-    fn reassign_from_neighbors(&mut self, centroid_id: u64) {
-        let centroid_vec = match self.centroid_vectors.get(&centroid_id) {
-            Some(v) => v.clone(),
-            None => return,
-        };
-
-        // Find neighboring centroids to check
-        let neighbors = self
+    /// SPFresh Condition 2: Reassign vectors from neighboring centroids after a split.
+    ///
+    /// For each vector v in a neighboring posting (centroid B), check if:
+    ///   min(D(v, A1), D(v, A2)) <= D(v, Ao)
+    ///
+    /// This means one of the new centroids is closer to v than the old centroid was.
+    /// If true, v might now belong to one of the new centroids, so we search for the
+    /// true nearest centroid.
+    fn reassign_from_neighbors_spfresh(
+        &mut self,
+        new_id1: u64,
+        new_id2: u64,
+        old_centroid: &[f32],
+        centroid1: &[f32],
+        centroid2: &[f32],
+    ) {
+        // Find neighbors of both new centroids
+        let neighbors1 = self
             .centroid_index
-            .search(&centroid_vec, self.config.reassign_neighbors + 1)
+            .search(centroid1, self.config.reassign_neighbors + 1)
             .expect("Search failed");
+        let neighbors2 = self
+            .centroid_index
+            .search(centroid2, self.config.reassign_neighbors + 1)
+            .expect("Search failed");
+
+        // Combine and deduplicate neighbor IDs
+        let mut neighbor_ids: Vec<u64> = neighbors1.keys.iter()
+            .chain(neighbors2.keys.iter())
+            .copied()
+            .filter(|&id| id != new_id1 && id != new_id2)
+            .collect();
+        neighbor_ids.sort();
+        neighbor_ids.dedup();
 
         let mut to_reassign: Vec<(u64, u64, StoredVector)> = Vec::new(); // (from, to, vector)
 
         // Check each neighbor's posting list
-        for &neighbor_id in &neighbors.keys {
-            if neighbor_id == centroid_id {
-                continue;
-            }
-
-            let neighbor_vec = match self.centroid_vectors.get(&neighbor_id) {
-                Some(v) => v.clone(),
-                None => continue,
-            };
-
+        for neighbor_id in neighbor_ids {
             if let Some(posting_list) = self.posting_lists.get_mut(&neighbor_id) {
                 let mut i = 0;
                 while i < posting_list.len() {
                     let v = &posting_list[i];
-                    let dist_to_new = Self::l2_distance(&v.data, &centroid_vec);
-                    let dist_to_current = Self::l2_distance(&v.data, &neighbor_vec);
+                    let dist_to_old = Self::l2_distance(&v.data, old_centroid);
+                    let dist_to_new1 = Self::l2_distance(&v.data, centroid1);
+                    let dist_to_new2 = Self::l2_distance(&v.data, centroid2);
+                    let min_dist_to_new = dist_to_new1.min(dist_to_new2);
 
-                    // Heuristic: only search for true nearest if closer to new centroid
-                    if dist_to_new < dist_to_current {
+                    // Condition 2: if either new centroid is closer than the old centroid,
+                    // check if v should be reassigned
+                    if min_dist_to_new <= dist_to_old {
                         // Find the true nearest centroid for this vector
                         let nearest = self.centroid_index.search(&v.data, 1).expect("Search failed");
                         let nearest_centroid = nearest.keys[0];
