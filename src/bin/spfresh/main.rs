@@ -33,6 +33,10 @@ pub struct SPFreshConfig {
     pub expansion_add: usize,
     /// HNSW expansion factor during search
     pub expansion_search: usize,
+    /// Query-aware dynamic pruning threshold (epsilon from SPANN paper)
+    /// Only search posting lists where: dist(q, centroid) <= (1 + epsilon) * dist(q, closest_centroid)
+    /// Set to 0.0 to disable pruning (search all num_probes posting lists)
+    pub pruning_threshold: f32,
 }
 
 impl Default for SPFreshConfig {
@@ -47,6 +51,7 @@ impl Default for SPFreshConfig {
             connectivity: 16,
             expansion_add: 128,
             expansion_search: 64,
+            pruning_threshold: 0.0, // disabled by default
         }
     }
 }
@@ -473,7 +478,9 @@ impl SPFreshIndex {
     }
 
     /// Search for k nearest neighbors
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    /// Uses query-aware dynamic pruning from SPANN: only search posting lists where
+    /// dist(q, centroid) <= (1 + epsilon) * dist(q, closest_centroid)
+    pub fn search(&self, query: &[f32], k: usize) -> SearchResult {
         assert_eq!(query.len(), self.config.dimensions, "Query dimension mismatch");
 
         // Find top centroids to probe
@@ -482,9 +489,30 @@ impl SPFreshIndex {
 
         // Collect all candidate vectors from probed posting lists
         let mut candidates: Vec<(u64, f32)> = Vec::new();
+        let mut probes_searched = 0;
 
-        for &centroid_id in &centroid_results.keys {
+        // Apply query-aware dynamic pruning (SPANN optimization)
+        // Only search posting lists where: dist <= (1 + epsilon) * min_dist
+        let pruning_enabled = self.config.pruning_threshold > 0.0;
+        let min_dist = if pruning_enabled && !centroid_results.distances.is_empty() {
+            centroid_results.distances[0]
+        } else {
+            0.0
+        };
+        let dist_threshold = if pruning_enabled {
+            (1.0 + self.config.pruning_threshold) * min_dist
+        } else {
+            f32::MAX
+        };
+
+        for (i, &centroid_id) in centroid_results.keys.iter().enumerate() {
+            // Dynamic pruning: skip posting lists that are too far from the query
+            if pruning_enabled && centroid_results.distances[i] > dist_threshold {
+                continue;
+            }
+
             if let Some(posting_list) = self.posting_lists.get(&centroid_id) {
+                probes_searched += 1;
                 for v in posting_list {
                     let dist = Self::l2_distance(query, &v.data);
                     candidates.push((v.id, dist));
@@ -495,7 +523,10 @@ impl SPFreshIndex {
         // Sort by distance and return top k
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         candidates.truncate(k);
-        candidates
+        SearchResult {
+            neighbors: candidates,
+            probes_searched,
+        }
     }
 
     /// Brute force search (for computing recall)
@@ -541,6 +572,11 @@ impl SPFreshIndex {
     pub fn set_expansion_search(&mut self, expansion_search: usize) {
         self.config.expansion_search = expansion_search;
         self.centroid_index.change_expansion_search(expansion_search);
+    }
+
+    /// Set the pruning threshold (for tuning recall/performance after loading)
+    pub fn set_pruning_threshold(&mut self, pruning_threshold: f32) {
+        self.config.pruning_threshold = pruning_threshold;
     }
 
     /// Get index statistics
@@ -658,6 +694,7 @@ impl SPFreshIndex {
   "connectivity": {},
   "expansion_add": {},
   "expansion_search": {},
+  "pruning_threshold": {},
   "num_centroids": {},
   "total_vectors": {},
   "num_splits": {},
@@ -677,6 +714,7 @@ impl SPFreshIndex {
             self.config.connectivity,
             self.config.expansion_add,
             self.config.expansion_search,
+            self.config.pruning_threshold,
             stats.num_centroids,
             stats.total_vectors,
             stats.num_splits,
@@ -757,9 +795,26 @@ impl SPFreshIndex {
             })
         };
 
+        // Parse float values (handles digits, decimal point, and negative sign)
+        let get_float_value = |key: &str| -> std::io::Result<f32> {
+            let pattern = format!("\"{}\": ", key);
+            let start = content.find(&pattern).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Missing key: {}", key))
+            })?;
+            let rest = &content[start + pattern.len()..];
+            let end = rest.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-').unwrap_or(rest.len());
+            rest[..end].parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid value for {}", key))
+            })
+        };
+
         // Optional values with defaults (for backward compatibility)
         let get_value_or_default = |key: &str, default: usize| -> usize {
             get_value(key).unwrap_or(default)
+        };
+
+        let get_float_or_default = |key: &str, default: f32| -> f32 {
+            get_float_value(key).unwrap_or(default)
         };
 
         Ok(SPFreshConfig {
@@ -772,6 +827,7 @@ impl SPFreshIndex {
             connectivity: get_value_or_default("connectivity", 16),
             expansion_add: get_value_or_default("expansion_add", 128),
             expansion_search: get_value_or_default("expansion_search", 64),
+            pruning_threshold: get_float_or_default("pruning_threshold", 0.0),
         })
     }
 
@@ -876,6 +932,14 @@ pub struct IndexStats {
     pub num_reassigned: usize,
 }
 
+/// Search result with statistics
+pub struct SearchResult {
+    /// The k nearest neighbors (id, distance)
+    pub neighbors: Vec<(u64, f32)>,
+    /// Number of posting lists actually searched
+    pub probes_searched: usize,
+}
+
 /// CLI arguments
 #[derive(Parser, Debug)]
 #[command(name = "spfresh")]
@@ -920,6 +984,12 @@ struct Args {
     /// HNSW expansion factor during search
     #[arg(long, default_value_t = 64)]
     expansion_search: usize,
+
+    /// Query-aware dynamic pruning threshold (epsilon from SPANN paper)
+    /// Only search posting lists where: dist(q, centroid) <= (1 + epsilon) * dist(q, closest)
+    /// Set to 0.0 to disable (default). Try 0.5-2.0 for recall@10, 0.1-0.6 for recall@1
+    #[arg(long, default_value_t = 0.0)]
+    pruning_threshold: f32,
 
     /// Number of queries for recall evaluation
     #[arg(long, default_value_t = 100)]
@@ -1028,6 +1098,7 @@ fn main() {
         connectivity: args.connectivity,
         expansion_add: args.expansion_add,
         expansion_search: args.expansion_search,
+        pruning_threshold: args.pruning_threshold,
     };
 
     println!("=== SPFresh Index Benchmark ===");
@@ -1056,10 +1127,12 @@ fn main() {
                 println!("  K-means iters:      {:>10}", saved_config.kmeans_iters);
                 println!("  Connectivity:       {:>10}", saved_config.connectivity);
                 println!("  Expansion add:      {:>10}", saved_config.expansion_add);
+                println!("  Pruning (saved):    {:>10.2}", saved_config.pruning_threshold);
 
                 // Override search parameters from command line
                 idx.set_num_probes(args.num_probes);
                 idx.set_expansion_search(args.expansion_search);
+                idx.set_pruning_threshold(args.pruning_threshold);
 
                 let stats = idx.stats();
                 println!();
@@ -1073,6 +1146,7 @@ fn main() {
                 println!("Search parameters (from args):");
                 println!("  Num probes:         {:>10}", args.num_probes);
                 println!("  Expansion search:   {:>10}", args.expansion_search);
+                println!("  Pruning threshold:  {:>10.2}", args.pruning_threshold);
                 idx
             }
             Err(e) => {
@@ -1096,6 +1170,7 @@ fn main() {
         println!("  Connectivity:       {:>10}", args.connectivity);
         println!("  Expansion add:      {:>10}", args.expansion_add);
         println!("  Expansion search:   {:>10}", args.expansion_search);
+        println!("  Pruning threshold:  {:>10.2}", args.pruning_threshold);
         println!("  Num queries:        {:>10}", args.num_queries);
         println!("  K (for k-NN):       {:>10}", args.k);
         println!("  Seed:               {:>10}", args.seed);
@@ -1228,23 +1303,26 @@ fn main() {
 
     let mut total_recall = 0.0;
     let mut search_times = Vec::with_capacity(queries.len());
+    let mut total_probes_searched: usize = 0;
 
     for (i, query) in queries.iter().enumerate() {
         let search_start = Instant::now();
-        let approximate = index.search(query, args.k);
+        let result = index.search(query, args.k);
         search_times.push(search_start.elapsed().as_secs_f64() * 1000.0); // ms
+        total_probes_searched += result.probes_searched;
 
         let recall = if let Some(ref gt) = ground_truth {
-            compute_recall_gt(&approximate, &gt[i], args.k)
+            compute_recall_gt(&result.neighbors, &gt[i], args.k)
         } else {
             let exact = index.brute_force_search(query, args.k);
-            compute_recall(&approximate, &exact)
+            compute_recall(&result.neighbors, &exact)
         };
         total_recall += recall;
     }
 
     let eval_time = start.elapsed();
     let avg_recall = total_recall / queries.len() as f64;
+    let avg_probes_searched = total_probes_searched as f64 / queries.len() as f64;
 
     search_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p50_latency = search_times[search_times.len() / 2];
@@ -1256,6 +1334,7 @@ fn main() {
     println!("=== Results ===");
     println!("  Dataset:            {:>10}", args.dataset);
     println!("  Recall@{}:          {:>10.4}", args.k, avg_recall);
+    println!("  Avg probes searched:{:>10.2}", avg_probes_searched);
     println!("  Avg latency:        {:>10.3} ms", avg_latency);
     println!("  P50 latency:        {:>10.3} ms", p50_latency);
     println!("  P99 latency:        {:>10.3} ms", p99_latency);
