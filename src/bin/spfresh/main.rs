@@ -801,8 +801,8 @@ impl SPFreshIndex {
             };
         }
 
-        // Sample random posting lists
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
+        // Sample random posting lists (use thread_rng for different selection each run)
+        let mut rng = rand::thread_rng();
         let mut sampled_ids = centroid_ids.clone();
         sampled_ids.shuffle(&mut rng);
         sampled_ids.truncate(num_samples);
